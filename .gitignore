@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# 虛擬環境
+.venv/
+venv/
+
+# 環境變數（含 Telegram token，切勿提交）
+.env
+
+# 測試 / 工具快取
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 編輯器
+.idea/
+.vscode/
+
+# 執行期產物
+*.log
+# add-scraper skill 偵錯時暫存的頁面快照
+*.html
+
+# 本機資料（如有改用 sqlite 開發）
+*.sqlite
+*.sqlite3

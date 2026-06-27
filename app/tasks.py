@@ -1,0 +1,177 @@
+"""Celery 任務：定時排程 + 單一商品檢查 + 價格 diff / 提醒 / 不支援流程。"""
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import html
+import logging
+
+from sqlalchemy import func, or_, select
+
+from app.alerts import notify_admins, send_message
+from app.celery_app import celery_app
+from app.config import settings
+from app.db import session_scope
+from app.extraction.adapters.base import Availability
+from app.extraction.pipeline import extract_price
+from app.models import (
+    PriceHistory,
+    ProductStatus,
+    RequestStatus,
+    TrackedProduct,
+    UnsupportedRequest,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+@celery_app.task(name="app.tasks.enqueue_due_checks")
+def enqueue_due_checks() -> int:
+    """掃描到期的 active 商品，逐一排入 check_product。回傳排入數量。"""
+    threshold = func.now() - func.make_interval(secs=TrackedProduct.check_interval_sec)
+    with session_scope() as session:
+        rows = session.execute(
+            select(TrackedProduct.id).where(
+                TrackedProduct.status == ProductStatus.ACTIVE,
+                or_(
+                    TrackedProduct.last_checked_at.is_(None),
+                    TrackedProduct.last_checked_at <= threshold,
+                ),
+            )
+        ).all()
+        ids = [r[0] for r in rows]
+    for product_id in ids:
+        check_product.delay(product_id)
+    logger.info("排入 %d 個商品檢查", len(ids))
+    return len(ids)
+
+
+def _money(value: float | None, currency: str | None) -> str:
+    if value is None:
+        return "—"
+    cur = currency or ""
+    return f"{value:,.0f} {cur}".strip()
+
+
+def _h(text: str | None) -> str:
+    """HTML 跳脫（用於 parse_mode=HTML 的訊息）。"""
+    return html.escape(text or "")
+
+
+@celery_app.task(name="app.tasks.check_product")
+def check_product(product_id: int) -> None:
+    # 1) 讀取必要欄位（不在抓取期間持有交易）
+    with session_scope() as session:
+        product = session.get(TrackedProduct, product_id)
+        if product is None:
+            return
+        url = product.url
+        domain = product.domain
+        chat_id = product.user.telegram_id
+        old_price = product.current_price
+        old_status = product.status
+
+    # 2) 跑萃取（網路慢，放在交易外）
+    try:
+        result = asyncio.run(extract_price(url))
+        extraction_error = None
+    except Exception as exc:  # noqa: BLE001
+        result = None
+        extraction_error = exc
+        logger.exception("萃取例外 product_id=%s", product_id)
+
+    # 3) 依結果更新並發送提醒
+    with session_scope() as session:
+        product = session.get(TrackedProduct, product_id)
+        if product is None:
+            return
+        product.last_checked_at = _utcnow()
+
+        # 3a) 抓取本身出錯（網路/逾時）→ 累計失敗、必要時告警
+        if extraction_error is not None:
+            product.consecutive_failures += 1
+            if product.consecutive_failures >= settings.max_consecutive_failures:
+                product.status = ProductStatus.ERROR
+                send_message(
+                    chat_id,
+                    f"⚠️ 連續 {product.consecutive_failures} 次抓取失敗，暫停追蹤：\n{_h(url)}",
+                )
+            return
+
+        assert result is not None
+        product.consecutive_failures = 0
+
+        # 3b) 不支援：標記 + 寫待辦 + 通知使用者與管理員
+        if not result.supported:
+            product.status = ProductStatus.UNSUPPORTED
+            _record_unsupported(session, domain, url, chat_id)
+            send_message(
+                chat_id,
+                "🛈 此網站目前不支援自動追蹤價格，已通知管理員新增支援：\n"
+                f"{_h(url)}",
+            )
+            notify_admins(f"🆕 待新增爬蟲網域：<b>{_h(domain)}</b>\n{_h(url)}")
+            return
+
+        # 3c) 缺貨
+        if result.availability == Availability.OUT_OF_STOCK:
+            _add_history(session, product_id, result.price, result.availability)
+            if old_status != ProductStatus.OUT_OF_STOCK:
+                product.status = ProductStatus.OUT_OF_STOCK
+                send_message(chat_id, f"⚠️ 商品目前缺貨：\n{_h(product.title or url)}")
+            return
+
+        # 3d) 正常：記錄、比較、提醒
+        product.status = ProductStatus.ACTIVE
+        if result.title:
+            product.title = result.title
+        if result.currency:
+            product.currency = result.currency
+        new_price = result.price
+        _add_history(session, product_id, new_price, result.availability)
+
+        if old_price is None:
+            # 首次取得價格
+            product.current_price = new_price
+            send_message(
+                chat_id,
+                f"✅ 已開始追蹤：\n<b>{_h(product.title or url)}</b>\n"
+                f"目前價格：{_money(new_price, product.currency)}",
+            )
+        elif new_price is not None and new_price != old_price:
+            arrow = "🔻 降價" if new_price < old_price else "🔺 漲價"
+            product.current_price = new_price
+            send_message(
+                chat_id,
+                f"{arrow}\n<b>{_h(product.title or url)}</b>\n"
+                f"{_money(old_price, product.currency)} → "
+                f"<b>{_money(new_price, product.currency)}</b>\n{_h(url)}",
+            )
+
+
+def _add_history(session, product_id: int, price: float | None, availability) -> None:
+    session.add(
+        PriceHistory(
+            product_id=product_id,
+            price=price,
+            availability=str(getattr(availability, "value", availability)),
+        )
+    )
+
+
+def _record_unsupported(session, domain: str, url: str, chat_id: int | None) -> None:
+    existing = session.execute(
+        select(UnsupportedRequest.id).where(
+            UnsupportedRequest.domain == domain,
+            UnsupportedRequest.status == RequestStatus.PENDING,
+        )
+    ).first()
+    if existing:
+        return
+    session.add(
+        UnsupportedRequest(domain=domain, url=url, requested_by=chat_id)
+    )

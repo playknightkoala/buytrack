@@ -1,0 +1,68 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: buytrack
+      POSTGRES_PASSWORD: buytrack
+      POSTGRES_DB: buytrack
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U buytrack"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # 一次性：建立資料表
+  initdb:
+    build: .
+    command: python -m app.init_db
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  bot:
+    build: .
+    command: python -m app.bot
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: celery -A app.celery_app.celery_app worker --loglevel=info --concurrency=4
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  beat:
+    build: .
+    command: celery -A app.celery_app.celery_app beat --loglevel=info
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
