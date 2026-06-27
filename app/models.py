@@ -45,6 +45,8 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     username: Mapped[str | None] = mapped_column(String(64), default=None)
+    first_name: Mapped[str | None] = mapped_column(String(128), default=None)
+    last_name: Mapped[str | None] = mapped_column(String(128), default=None)
     is_admin: Mapped[bool] = mapped_column(default=False)
     is_whitelisted: Mapped[bool] = mapped_column(default=False)  # 動態白名單（可由管理員開通）
     created_at: Mapped[dt.datetime] = mapped_column(

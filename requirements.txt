@@ -15,6 +15,7 @@ extruct==0.17.0
 w3lib==2.2.1
 selectolax==0.3.27
 tenacity==9.0.0
+matplotlib==3.9.2
 
 # --- Dev / tests ---
 pytest==8.3.3

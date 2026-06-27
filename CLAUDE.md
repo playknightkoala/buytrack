@@ -38,6 +38,7 @@
 ## Telegram bot 與授權（`app/bot.py`）
 - 互動式：指令會出現在輸入框旁選單；`/track /untrack /interval /status /allow` 都是**多步驟對話**（`ConversationHandler`），先下指令再輸入內容，**30 秒逾時自動取消**（需 `python-telegram-bot[job-queue]`，已在 requirements）。
 - `/untrack /interval /status` 會**先列出清單**再請使用者輸入編號。
+- `/status`：顯示狀態 + 現價/最高/最低 + 價格走勢圖 + 漲跌紀錄。走勢圖用 `price_history` 畫（`app/charts.py`，matplotlib step 圖，圖內只用英數避免中文字型亂碼，商品名放 caption），`reply_photo` 直接送 PNG bytes；歷史不足 2 筆則只回文字。
 - **授權守門**：`_auth_guard`（`TypeHandler`，`group=-1`）先於所有指令執行。
   - `/start` 一律放行 → 只記錄 `telegram_id`+`username`（每次更新最新），**不回應**。
   - 其餘指令：未授權者**完全靜默忽略**（不回訊息，只記 log）。
@@ -48,7 +49,7 @@
 ## 資料模型（`app/models.py`）
 - `users`：`telegram_id`、`username`、`is_admin`、`is_whitelisted`（動態白名單）
 - `tracked_products`：`status`、`check_interval_sec`、`consecutive_failures`、`current_price`…
-- `price_history`：每次檢查的價格/上下架紀錄
+- `price_history`：**價格或上下架狀態變動時**才記錄一筆（非每次檢查；首次取得價格也會記）
 - `unsupported_requests`：管理員待辦（三層都失敗的網域）
 
 > 新增/變更欄位：`init_db`（`create_all`）**不會**修改既有資料表，需用 Alembic 或手動 `ALTER TABLE`。
