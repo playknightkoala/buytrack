@@ -32,15 +32,17 @@ def _utcnow() -> dt.datetime:
 @celery_app.task(name="app.tasks.enqueue_due_checks")
 def enqueue_due_checks() -> int:
     """掃描到期的 active 商品，逐一排入 check_product。回傳排入數量。"""
-    threshold = func.now() - func.make_interval(secs=TrackedProduct.check_interval_sec)
+    # 到期條件：從未檢查過，或距離上次檢查已超過該商品的間隔秒數
+    due = or_(
+        TrackedProduct.last_checked_at.is_(None),
+        func.extract("epoch", func.now() - TrackedProduct.last_checked_at)
+        >= TrackedProduct.check_interval_sec,
+    )
     with session_scope() as session:
         rows = session.execute(
             select(TrackedProduct.id).where(
                 TrackedProduct.status == ProductStatus.ACTIVE,
-                or_(
-                    TrackedProduct.last_checked_at.is_(None),
-                    TrackedProduct.last_checked_at <= threshold,
-                ),
+                due,
             )
         ).all()
         ids = [r[0] for r in rows]
@@ -117,10 +119,10 @@ def check_product(product_id: int) -> None:
             notify_admins(f"🆕 待新增爬蟲網域：<b>{_h(domain)}</b>\n{_h(url)}")
             return
 
-        # 3c) 缺貨
+        # 3c) 缺貨（只在「轉為缺貨」的當下記錄一筆，避免每次檢查重複記）
         if result.availability == Availability.OUT_OF_STOCK:
-            _add_history(session, product_id, result.price, result.availability)
             if old_status != ProductStatus.OUT_OF_STOCK:
+                _add_history(session, product_id, result.price, result.availability)
                 product.status = ProductStatus.OUT_OF_STOCK
                 send_message(chat_id, f"⚠️ 商品目前缺貨：\n{_h(product.title or url)}")
             return
@@ -132,7 +134,9 @@ def check_product(product_id: int) -> None:
         if result.currency:
             product.currency = result.currency
         new_price = result.price
-        _add_history(session, product_id, new_price, result.availability)
+        # 只在「首次取得價格」「價格變動」或「從缺貨/錯誤等狀態恢復」時記錄一筆
+        if old_price is None or new_price != old_price or old_status != ProductStatus.ACTIVE:
+            _add_history(session, product_id, new_price, result.availability)
 
         if old_price is None:
             # 首次取得價格

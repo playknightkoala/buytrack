@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from telegram import BotCommand, BotCommandScopeChat, Update
 from telegram.ext import (
@@ -29,7 +30,16 @@ from telegram.ext import (
 from app.config import settings
 from app.db import session_scope
 from app.extraction.context import domain_of
-from app.models import ProductStatus, RequestStatus, TrackedProduct, UnsupportedRequest, User
+from app.models import (
+    PriceHistory,
+    ProductStatus,
+    RequestStatus,
+    TrackedProduct,
+    UnsupportedRequest,
+    User,
+)
+
+_TZ = ZoneInfo("Asia/Taipei")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -54,26 +64,36 @@ WELCOME_TEXT = (
     "/list — 我的追蹤清單\n"
     "/untrack — 取消追蹤\n"
     "/interval — 設定檢查間隔\n"
-    "/status — 查看商品狀態\n"
+    "/status — 查看狀態與價格歷史\n"
     "/cancel — 取消目前操作"
 )
 
 
 # ----------------------- 同步 DB 操作 -----------------------
 
-def _get_or_create_user(telegram_id: int, username: str | None = None) -> int:
+def _get_or_create_user(
+    telegram_id: int,
+    username: str | None = None,
+    first_name: str | None = None,
+    last_name: str | None = None,
+) -> int:
     with session_scope() as s:
         user = s.query(User).filter_by(telegram_id=telegram_id).one_or_none()
         if user is None:
             user = User(
                 telegram_id=telegram_id,
                 username=username,
+                first_name=first_name,
+                last_name=last_name,
                 is_admin=telegram_id in settings.admin_id_set,
             )
             s.add(user)
             s.flush()
-        elif username is not None and user.username != username:
-            user.username = username  # username 可能變更，每次更新為最新
+        else:
+            # 名稱可能變更，每次更新為最新
+            user.username = username
+            user.first_name = first_name
+            user.last_name = last_name
         return user.id
 
 
@@ -84,11 +104,21 @@ def _list_all_users() -> list[dict]:
             {
                 "telegram_id": u.telegram_id,
                 "username": u.username,
+                "first_name": u.first_name,
+                "last_name": u.last_name,
                 "is_admin": u.is_admin,
                 "is_whitelisted": u.is_whitelisted,
             }
             for u in users
         ]
+
+
+def _display_name(row: dict) -> str:
+    """優先顯示 @username；沒有則用 first_name + last_name；都沒有才顯示「沒有任何名稱」。"""
+    if row.get("username"):
+        return f"@{row['username']}"
+    full = " ".join(x for x in (row.get("first_name"), row.get("last_name")) if x).strip()
+    return full or "(沒有任何名稱)"
 
 
 def _is_whitelisted_db(telegram_id: int) -> bool:
@@ -179,6 +209,32 @@ def _set_interval(telegram_id: int, product_id: int, minutes: int) -> bool:
         return True
 
 
+def _price_history(telegram_id: int, product_id: int) -> dict | None:
+    with session_scope() as s:
+        product = (
+            s.query(TrackedProduct)
+            .join(User)
+            .filter(TrackedProduct.id == product_id, User.telegram_id == telegram_id)
+            .one_or_none()
+        )
+        if product is None:
+            return None
+        rows = (
+            s.query(PriceHistory)
+            .filter(PriceHistory.product_id == product_id, PriceHistory.price.isnot(None))
+            .order_by(PriceHistory.checked_at.asc())
+            .all()
+        )
+        return {
+            "title": product.title or product.url,
+            "url": product.url,
+            "status": product.status.value,
+            "currency": product.currency,
+            "current": product.current_price,
+            "points": [(r.checked_at, r.price) for r in rows],
+        }
+
+
 def _list_pending() -> list[dict]:
     with session_scope() as s:
         rows = (
@@ -228,6 +284,36 @@ async def _show_list_or_end(update: Update, uid: int) -> list[dict] | None:
 _HINT = "（30 秒未回應將自動取消，或輸入 /cancel 取消）"
 
 
+def _fmt_price(price: float | None, currency: str | None) -> str:
+    if price is None:
+        return "—"
+    return f"{price:,.0f} {currency or ''}".strip()
+
+
+def _format_changes(points: list[tuple], currency: str | None, limit: int = 12) -> list[str]:
+    """從歷史點位整理出「價格有變動」的事件，最新在前。"""
+    events: list[tuple] = []
+    prev: float | None = None
+    for checked_at, price in points:
+        if prev is None or price != prev:
+            delta = None if prev is None else price - prev
+            events.append((checked_at, price, delta))
+            prev = price
+    lines = []
+    for checked_at, price, delta in reversed(events[-limit:]):
+        ts = checked_at.astimezone(_TZ).strftime("%Y-%m-%d %H:%M")
+        if delta is None:
+            mark = ""
+        elif delta > 0:
+            mark = f"  🔺{abs(delta):,.0f}"
+        elif delta < 0:
+            mark = f"  🔻{abs(delta):,.0f}"
+        else:
+            mark = ""
+        lines.append(f"{ts}  {_fmt_price(price, currency)}{mark}")
+    return lines
+
+
 # ----------------------- 白名單守門 -----------------------
 
 async def _authorized(telegram_id: int) -> bool:
@@ -265,9 +351,11 @@ async def _auth_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ----------------------- 簡單指令 -----------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # 依需求：/start 只記錄使用者（含 username），不回應任何訊息。
+    # 依需求：/start 只記錄使用者（含 username / 姓名），不回應任何訊息。
     user = update.effective_user
-    await asyncio.to_thread(_get_or_create_user, user.id, user.username)
+    await asyncio.to_thread(
+        _get_or_create_user, user.id, user.username, user.first_name, user.last_name
+    )
     logger.info("/start 記錄使用者：%s (@%s)", user.id, user.username)
 
 
@@ -289,14 +377,13 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     lines = [f"目前使用者（共 {len(rows)} 位）："]
     for r in rows:
-        uname = f"@{r['username']}" if r["username"] else "(無 username)"
         if r["is_admin"]:
             tag = " 👑管理員"
         elif r["is_whitelisted"]:
             tag = " ✅已開通"
         else:
             tag = " ⛔未開通"
-        lines.append(f"• {r['telegram_id']} {uname}{tag}")
+        lines.append(f"• {r['telegram_id']} {_display_name(r)}{tag}")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -374,7 +461,7 @@ async def untrack_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def status_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await _show_list_or_end(update, update.effective_user.id) is None:
         return ConversationHandler.END
-    await update.message.reply_text(f"請輸入要「查看狀態」的編號。\n{_HINT}")
+    await update.message.reply_text(f"請輸入要查看的編號（狀態 + 價格歷史）。\n{_HINT}")
     return ASK_STATUS_ID
 
 
@@ -383,18 +470,38 @@ async def status_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not text.isdigit():
         await update.message.reply_text(f"請輸入數字編號。\n{_HINT}")
         return ASK_STATUS_ID
-    products = await asyncio.to_thread(_list_products, update.effective_user.id)
-    target = next((p for p in products if p["id"] == int(text)), None)
-    if target is None:
+    data = await asyncio.to_thread(_price_history, update.effective_user.id, int(text))
+    if data is None:
         await update.message.reply_text("找不到該編號的商品。")
         return ConversationHandler.END
-    price = "—"
-    if target["price"] is not None:
-        price = f"{target['price']:,.0f} {target['currency'] or ''}".strip()
-    await update.message.reply_text(
-        f"#{target['id']}\n狀態：{target['status']}\n目前價格：{price}\n{target['url']}",
-        disable_web_page_preview=True,
-    )
+
+    points = data["points"]
+    currency = data["currency"]
+    lines = [
+        f"#{int(text)}　📊 {data['title']}",
+        f"狀態：{data['status']}",
+        f"現在：{_fmt_price(data['current'], currency)}",
+    ]
+    if points:
+        ys = [p[1] for p in points]
+        lines.append(f"最高：{_fmt_price(max(ys), currency)}　最低：{_fmt_price(min(ys), currency)}")
+    lines.append(data["url"])
+    summary = "\n".join(lines)
+
+    if len(points) >= 2:
+        from app.charts import render_price_history  # 延遲 import，避免啟動載入 matplotlib
+
+        png = await asyncio.to_thread(render_price_history, points, currency)
+        await update.message.reply_photo(photo=png, caption=summary)
+    else:
+        await update.message.reply_text(summary, disable_web_page_preview=True)
+
+    changes = _format_changes(points, currency)
+    if changes:
+        await update.message.reply_text(
+            "漲跌紀錄（最新在前）：\n" + "\n".join(changes),
+            disable_web_page_preview=True,
+        )
     return ConversationHandler.END
 
 
@@ -446,8 +553,7 @@ async def allow_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if pending:
         lines = ["尚未開通的使用者："]
         for r in pending:
-            uname = f"@{r['username']}" if r["username"] else "(無 username)"
-            lines.append(f"• {r['telegram_id']} {uname}")
+            lines.append(f"• {r['telegram_id']} {_display_name(r)}")
         await update.message.reply_text("\n".join(lines))
     else:
         await update.message.reply_text("（目前沒有未開通的使用者，仍可手動輸入任意 ID）")
@@ -503,7 +609,7 @@ COMMANDS = [
     BotCommand("list", "我的追蹤清單"),
     BotCommand("untrack", "取消追蹤"),
     BotCommand("interval", "設定檢查間隔"),
-    BotCommand("status", "查看商品狀態"),
+    BotCommand("status", "查看狀態與價格歷史"),
     BotCommand("cancel", "取消目前操作"),
 ]
 

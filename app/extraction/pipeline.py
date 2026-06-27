@@ -37,8 +37,9 @@ async def extract_price(url: str) -> ExtractionResult:
             result = parse_structured(html, url, method_prefix="static")
             if result.has_price:
                 return result
-        except Exception:
-            logger.info("L0 靜態抓取失敗: %s", url, exc_info=True)
+        except Exception as exc:
+            # L0 失敗（如 429）屬正常情形，會自動往下走 L1；只記一行摘要
+            logger.info("L0 靜態抓取失敗，改用渲染層: %s (%s)", url, exc)
 
         # L1：Playwright 渲染後 + 結構化資料
         try:
@@ -46,8 +47,8 @@ async def extract_price(url: str) -> ExtractionResult:
             result = parse_structured(html, url, method_prefix="rendered")
             if result.has_price:
                 return result
-        except Exception:
-            logger.info("L1 渲染抓取失敗: %s", url, exc_info=True)
+        except Exception as exc:
+            logger.info("L1 渲染抓取失敗: %s (%s)", url, exc)
 
         # 全部失敗：標記不支援，交由管理員透過 /add-scraper 新增 adapter
         return ExtractionResult.unsupported(method="exhausted")
