@@ -16,7 +16,7 @@ import datetime as dt
 from sqlalchemy import select
 
 from app.db import session_scope
-from app.models import RequestStatus, UnsupportedRequest
+from app.models import ProductStatus, RequestStatus, TrackedProduct, UnsupportedRequest
 
 
 def cmd_test(url: str) -> None:
@@ -46,17 +46,63 @@ def cmd_pending() -> None:
 
 
 def cmd_resolve(domain: str) -> None:
+    """標記待辦完成，並（1）重新啟用該網域被標為 unsupported 的商品、
+    立即排一次檢查，（2）通知當初請求的使用者「現在已支援」。
+    """
+    from app.alerts import send_message
+    from app.tasks import check_product  # 延遲 import，避免無 broker 環境載入失敗
+
+    notify_ids: set[int] = set()
+    reactivated: list[int] = []
     with session_scope() as s:
-        rows = s.execute(
-            select(UnsupportedRequest).where(
-                UnsupportedRequest.domain == domain,
-                UnsupportedRequest.status == RequestStatus.PENDING,
+        reqs = (
+            s.execute(
+                select(UnsupportedRequest).where(
+                    UnsupportedRequest.domain == domain,
+                    UnsupportedRequest.status == RequestStatus.PENDING,
+                )
             )
-        ).scalars().all()
-        for r in rows:
+            .scalars()
+            .all()
+        )
+        for r in reqs:
             r.status = RequestStatus.RESOLVED
             r.resolved_at = dt.datetime.now(dt.timezone.utc)
-        print(f"已將 {len(rows)} 筆 {domain} 的待辦標記為已處理。")
+            if r.requested_by:
+                notify_ids.add(r.requested_by)
+
+        # 重新啟用此網域仍是 unsupported 的追蹤商品
+        prods = (
+            s.query(TrackedProduct)
+            .filter(
+                TrackedProduct.domain == domain,
+                TrackedProduct.status == ProductStatus.UNSUPPORTED,
+            )
+            .all()
+        )
+        for p in prods:
+            p.status = ProductStatus.ACTIVE
+            p.consecutive_failures = 0
+            reactivated.append(p.id)
+            notify_ids.add(p.user.telegram_id)
+        n_reqs = len(reqs)
+
+    # 立即排一次檢查，讓使用者馬上拿到價格
+    for pid in reactivated:
+        check_product.delay(pid)
+
+    # 通知當初請求/受影響的使用者
+    for uid in notify_ids:
+        send_message(
+            uid,
+            f"✅ 你先前追蹤的網站「{domain}」現在已支援自動追蹤價格了，"
+            "系統會開始為你監控，並在價格變動時通知你。",
+        )
+
+    print(
+        f"已處理 {n_reqs} 筆待辦；重新啟用 {len(reactivated)} 個商品；"
+        f"通知 {len(notify_ids)} 位使用者。"
+    )
 
 
 def cmd_domains() -> None:

@@ -68,10 +68,11 @@ python -m app.admin test "<url>"     # 這次應顯示 supported: True 且 metho
 ```
 若仍失敗：回步驟 3 調整選擇器；若該站反爬擋住，於 adapter 內用 `wait_selector`、必要時在 `.env` 設定 `PROXY_POOL`。
 
-### 7. 標記待辦完成
+### 7. 標記待辦完成（會自動通知使用者）
 ```bash
 python -m app.admin resolve <domain>
 ```
+`resolve` 除了把待辦標記為已處理，還會：**重新啟用**該網域被標為 `unsupported` 的追蹤商品（設回 ACTIVE、立即排一次檢查），並**私訊通知**當初請求的使用者「現在已支援」。
 adapter 檔案放進 `adapters/` 後會被 registry 自動探索掛載，**無需修改其他程式**，worker 重啟後即生效。
 
 ## 完成後回報
