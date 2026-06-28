@@ -170,6 +170,7 @@ def _list_products(telegram_id: int) -> list[dict]:
                 "id": p.id,
                 "title": p.title,
                 "url": p.url,
+                "domain": p.domain,
                 "price": p.current_price,
                 "currency": p.currency,
                 "status": p.status.value,
@@ -228,6 +229,7 @@ def _price_history(telegram_id: int, product_id: int) -> dict | None:
         return {
             "title": product.title or product.url,
             "url": product.url,
+            "domain": product.domain,
             "status": product.status.value,
             "currency": product.currency,
             "current": product.current_price,
@@ -267,7 +269,8 @@ def _format_products(products: list[dict]) -> str:
         if p["price"] is not None:
             price = f"{p['price']:,.0f} {p['currency'] or ''}".strip()
         title = p["title"] or p["url"]
-        lines.append(f"#{p['id']} [{p['status']}] {price}\n{title}")
+        site = site_label(p.get("domain"))
+        lines.append(f"#{p['id']}｜{site}｜{p['status']}｜{price}\n{title}")
     return "\n\n".join(lines)
 
 
@@ -282,6 +285,33 @@ async def _show_list_or_end(update: Update, uid: int) -> list[dict] | None:
 
 
 _HINT = "（30 秒未回應將自動取消，或輸入 /cancel 取消）"
+
+
+# 已知購物網的好讀名稱（key 用可比對的網域字尾；子網域自動對應）
+SITE_NAMES = {
+    "momoshop.com.tw": "momo購物網",
+    "pchome.com.tw": "PChome",
+    "books.com.tw": "博客來",
+    "shopee.tw": "蝦皮購物",
+    "ruten.com.tw": "露天市集",
+    "yahoo.com.tw": "Yahoo購物",
+    "coupang.com": "Coupang 酷澎",
+    "fromjapan.co.jp": "FROM JAPAN",
+    "grail.bz": "GRL",
+    "amazon.co.jp": "Amazon JP",
+    "amazon.com": "Amazon",
+}
+
+
+def site_label(domain: str | None) -> str:
+    """由網域對應好讀的購物網名稱；未知則直接顯示網域。"""
+    if not domain:
+        return "未知網站"
+    d = domain.lower()
+    for suffix, name in SITE_NAMES.items():
+        if d == suffix or d.endswith("." + suffix):
+            return name
+    return domain
 
 
 def _fmt_price(price: float | None, currency: str | None) -> str:
@@ -479,6 +509,7 @@ async def status_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     currency = data["currency"]
     lines = [
         f"#{int(text)}　📊 {data['title']}",
+        f"購物網：{site_label(data.get('domain'))}",
         f"狀態：{data['status']}",
         f"現在：{_fmt_price(data['current'], currency)}",
     ]
