@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from telegram import BotCommand, BotCommandScopeChat, Update
@@ -145,9 +145,23 @@ def _set_whitelisted(telegram_id: int) -> bool:
         return not was_allowed
 
 
-def _add_product(telegram_id: int, url: str) -> int:
+def _add_product(telegram_id: int, url: str) -> tuple[int, bool]:
+    """新增追蹤。回傳 (product_id, is_duplicate)。
+
+    重複判定：同一使用者、正規化後相同的 URL（同網站不同商品不算重複）。
+    若重複則不新增，回傳既有商品 id 與 True。
+    """
     user_id = _get_or_create_user(telegram_id)
+    target_key = _normalize_url(url)
     with session_scope() as s:
+        existing = (
+            s.query(TrackedProduct)
+            .filter(TrackedProduct.user_id == user_id)
+            .all()
+        )
+        for p in existing:
+            if _normalize_url(p.url) == target_key:
+                return p.id, True
         product = TrackedProduct(
             user_id=user_id,
             url=url,
@@ -157,7 +171,7 @@ def _add_product(telegram_id: int, url: str) -> int:
         )
         s.add(product)
         s.flush()
-        return product.id
+        return product.id, False
 
 
 def _list_products(telegram_id: int) -> list[dict]:
@@ -254,6 +268,41 @@ def _list_pending() -> list[dict]:
 def _valid_url(text: str) -> bool:
     parts = urlsplit(text)
     return parts.scheme in ("http", "https") and bool(parts.hostname)
+
+
+# 行銷/追蹤用的 query 參數（比對重複時忽略，避免同商品因連結帶不同 utm 而漏判）
+_TRACKING_KEYS = {
+    "gclid", "fbclid", "yclid", "msclkid", "igshid", "_ga",
+    "gbraid", "wbraid", "mc_cid", "mc_eid", "dclid",
+}
+
+
+def _is_tracking_param(key: str) -> bool:
+    k = key.lower()
+    return k.startswith("utm_") or k in _TRACKING_KEYS
+
+
+def _normalize_url(url: str) -> str:
+    """正規化 URL 作為「是否為同一商品」的比較鍵（不影響實際抓取用的原始 URL）。
+
+    - host 轉小寫、去掉開頭 www.
+    - 移除追蹤參數、其餘 query 依字母排序
+    - 去掉結尾斜線與 fragment
+    （注意：保留其他 query 參數，因 momo 等站以 query 識別商品）
+    """
+    p = urlsplit(url)
+    host = (p.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    netloc = f"{host}:{p.port}" if p.port else host
+    query_pairs = [
+        (k, v)
+        for k, v in parse_qsl(p.query, keep_blank_values=True)
+        if not _is_tracking_param(k)
+    ]
+    query_pairs.sort()
+    path = p.path.rstrip("/") or "/"
+    return urlunsplit((p.scheme.lower(), netloc, path, urlencode(query_pairs), ""))
 
 
 def _enqueue_check(product_id: int) -> None:
@@ -459,7 +508,15 @@ async def track_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not _valid_url(url):
         await update.message.reply_text(f"這不是有效的 http(s) 網址，請重貼。\n{_HINT}")
         return ASK_URL
-    product_id = await asyncio.to_thread(_add_product, update.effective_user.id, url)
+    product_id, is_duplicate = await asyncio.to_thread(
+        _add_product, update.effective_user.id, url
+    )
+    if is_duplicate:
+        await update.message.reply_text(
+            f"⚠️ 你已經在追蹤這個商品了（編號 #{product_id}），不需重複加入。\n"
+            "可用 /status 查看，或 /list 看全部。"
+        )
+        return ConversationHandler.END
     _enqueue_check(product_id)
     await update.message.reply_text(
         f"已加入追蹤（編號 {product_id}），正在抓取首次價格，稍後通知你…"

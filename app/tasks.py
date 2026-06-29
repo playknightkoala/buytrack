@@ -93,31 +93,51 @@ def check_product(product_id: int) -> None:
             return
         product.last_checked_at = _utcnow()
 
-        # 3a) 抓取本身出錯（網路/逾時）→ 累計失敗、必要時告警
+        # 3a) 抓取本身出錯（網路/逾時例外）→ 累計失敗、達門檻則暫停並提醒
         if extraction_error is not None:
             product.consecutive_failures += 1
             if product.consecutive_failures >= settings.max_consecutive_failures:
                 product.status = ProductStatus.ERROR
                 send_message(
                     chat_id,
-                    f"⚠️ 連續 {product.consecutive_failures} 次抓取失敗，暫停追蹤：\n{_h(url)}",
+                    f"⚠️ 「{_h(product.title or url)}」連續抓取失敗（網路或網站異常），"
+                    "已暫停追蹤。可用 /interval 重新啟用。",
                 )
             return
 
         assert result is not None
-        product.consecutive_failures = 0
 
-        # 3b) 不支援：標記 + 寫待辦 + 通知使用者與管理員
+        # 3b) 三層都拿不到價格
         if not result.supported:
-            product.status = ProductStatus.UNSUPPORTED
-            _record_unsupported(session, domain, url, chat_id)
-            send_message(
-                chat_id,
-                "🛈 此網站目前不支援自動追蹤價格，已通知管理員新增支援：\n"
-                f"{_h(url)}",
-            )
-            notify_admins(f"🆕 待新增爬蟲網域：<b>{_h(domain)}</b>\n{_h(url)}")
+            if old_price is None:
+                # 全新、從未成功取得價格 → 此網站尚未支援，請管理員新增
+                product.status = ProductStatus.UNSUPPORTED
+                _record_unsupported(session, domain, url, chat_id)
+                send_message(
+                    chat_id,
+                    "🛈 此網站目前不支援自動追蹤價格，已通知管理員新增支援：\n"
+                    f"{_h(url)}",
+                )
+                notify_admins(f"🆕 待新增爬蟲網域：<b>{_h(domain)}</b>\n{_h(url)}")
+            else:
+                # 曾經成功、現在抓不到 → 爬蟲失效；容忍數次（避免一次性誤判）後判定
+                product.consecutive_failures += 1
+                if product.consecutive_failures >= settings.max_consecutive_failures:
+                    product.status = ProductStatus.UNSUPPORTED
+                    _record_unsupported(session, domain, url, chat_id)
+                    send_message(
+                        chat_id,
+                        f"⚠️ 「{_h(product.title or url)}」的價格抓取已失效"
+                        "（網站可能改版或被擋），已暫停追蹤，並已通知管理員修復。",
+                    )
+                    notify_admins(
+                        f"⚠️ 既有商品抓取失效（疑似網站改版 / adapter 失效）："
+                        f"<b>{_h(domain)}</b>\n{_h(url)}"
+                    )
             return
+
+        # 成功取得結果（含缺貨）→ 歸零連續失敗計數
+        product.consecutive_failures = 0
 
         # 3c) 缺貨（只在「轉為缺貨」的當下記錄一筆，避免每次檢查重複記）
         if result.availability == Availability.OUT_OF_STOCK:
