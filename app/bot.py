@@ -188,6 +188,7 @@ def _list_products(telegram_id: int) -> list[dict]:
                 "price": p.current_price,
                 "currency": p.currency,
                 "status": p.status.value,
+                "last_checked_at": p.last_checked_at,
             }
             for p in sorted(user.products, key=lambda x: x.id)
         ]
@@ -247,6 +248,7 @@ def _price_history(telegram_id: int, product_id: int) -> dict | None:
             "status": product.status.value,
             "currency": product.currency,
             "current": product.current_price,
+            "last_checked_at": product.last_checked_at,
             "points": [(r.checked_at, r.price) for r in rows],
         }
 
@@ -319,7 +321,10 @@ def _format_products(products: list[dict]) -> str:
             price = f"{p['price']:,.0f} {p['currency'] or ''}".strip()
         title = p["title"] or p["url"]
         site = site_label(p.get("domain"))
-        lines.append(f"#{p['id']}｜{site}｜{p['status']}｜{price}\n{title}")
+        checked = _fmt_checked(p.get("last_checked_at"))
+        lines.append(
+            f"#{p['id']}｜{site}｜{p['status']}｜{price}\n{title}\n🕒 最近爬文：{checked}"
+        )
     return "\n\n".join(lines)
 
 
@@ -361,6 +366,13 @@ def site_label(domain: str | None) -> str:
         if d == suffix or d.endswith("." + suffix):
             return name
     return domain
+
+
+def _fmt_checked(checked_at) -> str:
+    """最近檢查時間（轉台北時間顯示）。"""
+    if checked_at is None:
+        return "尚未檢查"
+    return checked_at.astimezone(_TZ).strftime("%m/%d %H:%M")
 
 
 def _fmt_price(price: float | None, currency: str | None) -> str:
@@ -569,6 +581,7 @@ async def status_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"購物網：{site_label(data.get('domain'))}",
         f"狀態：{data['status']}",
         f"現在：{_fmt_price(data['current'], currency)}",
+        f"🕒 最近爬文：{_fmt_checked(data.get('last_checked_at'))}",
     ]
     if points:
         ys = [p[1] for p in points]
