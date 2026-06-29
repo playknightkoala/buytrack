@@ -104,6 +104,17 @@ class PriceHistory(Base):
     product: Mapped[TrackedProduct] = relationship(back_populates="history")
 
 
+class AnnouncedVersion(Base):
+    """已公告（推播）過的版本，避免重啟時重複推播。"""
+
+    __tablename__ = "announced_versions"
+
+    version: Mapped[str] = mapped_column(String(32), primary_key=True)
+    announced_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class UnsupportedRequest(Base):
     """三層自動萃取都失敗的網站 → 管理員待辦清單。"""
 

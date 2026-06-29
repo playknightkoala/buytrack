@@ -27,9 +27,11 @@ from telegram.ext import (
     filters,
 )
 
+from app.broadcast import broadcast_if_new, changelog_for
 from app.config import settings
 from app.db import session_scope
 from app.extraction.context import domain_of
+from app.version import __version__
 from app.models import (
     PriceHistory,
     ProductStatus,
@@ -478,6 +480,14 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
+async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    notes = changelog_for(__version__)
+    text = f"目前版本：v{__version__}"
+    if notes:
+        text += f"\n\n{notes}"
+    await update.message.reply_text(text)
+
+
 async def pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in settings.admin_id_set:
         await update.message.reply_text("此指令僅限管理員。")
@@ -711,11 +721,13 @@ COMMANDS = [
     BotCommand("untrack", "取消追蹤"),
     BotCommand("interval", "設定檢查間隔"),
     BotCommand("status", "查看狀態與價格歷史"),
+    BotCommand("version", "查看版本與更新內容"),
     BotCommand("cancel", "取消目前操作"),
 ]
 
 
 async def _post_init(app: Application) -> None:
+    logger.info("Bot 版本 v%s 啟動", __version__)
     # 一般使用者選單
     await app.bot.set_my_commands(COMMANDS)
     # 管理員額外提供 /pending（以聊天室範圍設定，不影響其他人）
@@ -731,6 +743,12 @@ async def _post_init(app: Application) -> None:
             )
         except Exception:
             logger.warning("設定管理員指令選單失敗：%s", admin_id)
+
+    # 若目前版本尚未公告過，推播改版資訊給已開通使用者（DB 記錄避免重複）
+    try:
+        await asyncio.to_thread(broadcast_if_new)
+    except Exception:
+        logger.exception("版本公告推播失敗")
 
 
 def build_application() -> Application:
@@ -748,6 +766,7 @@ def build_application() -> Application:
     # 簡單指令
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("list", list_cmd))
+    app.add_handler(CommandHandler("version", version_cmd))
     app.add_handler(CommandHandler("pending", pending_cmd))
     app.add_handler(CommandHandler("users", users_cmd))
 
