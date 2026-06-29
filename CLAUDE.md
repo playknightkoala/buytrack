@@ -46,6 +46,11 @@
 - **管理員指令**（`/allow`、`/users`、`/pending`）只在管理員自己的選單顯示（`BotCommandScopeChat`），且 handler 內再次驗證 `admin_id_set`。`/allow` 開通後會立即私訊對方 `WELCOME_TEXT`。
 - 改動 `.env` 的 `ADMIN_IDS` 後需重啟 `bot` 讓 `_post_init` 重設選單。
 
+## 版本與發版
+- 版本單一來源：`app/version.py` 的 `__version__`（SemVer）；改版說明在 `CHANGELOG.md`；git tag `vX.Y.Z`。
+- bot 啟動時若偵測目前版本尚未公告，會把 CHANGELOG 對應段落**自動推播給已開通使用者**（`app/broadcast.py`，用 `announced_versions` 表去重）。
+- **發新版請走 `/add-scraper` 同層的 `release` skill（`.claude/skills/release/`）**：bump 版號 → 寫 CHANGELOG → commit/push/tag → `docker compose up -d --build bot`（必須 `--build` 才會帶新版號並觸發推播）。
+
 ## 資料模型（`app/models.py`）
 - `users`：`telegram_id`、`username`、`is_admin`、`is_whitelisted`（動態白名單）
 - `tracked_products`：`status`、`check_interval_sec`、`consecutive_failures`、`current_price`…
