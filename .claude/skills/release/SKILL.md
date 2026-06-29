@@ -44,11 +44,17 @@ git push origin main
 ```
 （若直接推 main 被權限擋下，改推 feature 分支再開 PR 合併。）
 
-### 5. 打 tag 並 push
+### 5. 打 tag 並 push（→ 自動建立 GitHub Release）
 ```bash
 git tag -a v1.1.0 -m "v1.1.0"
 git push origin v1.1.0
 ```
+push tag 後，GitHub Actions（`.github/workflows/release.yml`）會自動建立對應的
+**GitHub Release**，notes 取自 CHANGELOG 該版區段（這是給看 GitHub 的人看的）。
+
+> 一次發版有兩個輸出、同一來源（tag + CHANGELOG）：
+> GitHub Release（雲端，push tag 自動產生）＋ Telegram 推播（本機 bot 部署時，下一步）。
+> bot 是本機自架、GitHub 連不進來，所以 Telegram 推播不綁 Release 事件，而是在重建 bot 時觸發。
 
 ### 6. 重建 bot（觸發自動推播）
 ```bash
