@@ -6,6 +6,10 @@ services:
       POSTGRES_USER: buytrack
       POSTGRES_PASSWORD: buytrack
       POSTGRES_DB: buytrack
+    # 預設不對主機發布 5432（僅 Docker 內部網路可連）。
+    # 若臨時要用 DB 管理器連入，再加：
+    #   ports:
+    #     - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
