@@ -1,0 +1,39 @@
+name: Release
+
+# 每當 push 形如 v1.2.3 的 tag，就自動建立對應的 GitHub Release，
+# release notes 取自 CHANGELOG.md 中該版本的區段。
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write  # 建立 Release 需要
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 從 CHANGELOG 擷取本版說明
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"   # v1.2.3 -> 1.2.3
+          awk -v ver="$VERSION" '
+            $0 ~ ("^## \\[" ver "\\]") { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          # 若 CHANGELOG 找不到對應段落，退而用一行預設文字
+          if [ ! -s notes.md ]; then
+            echo "Release ${GITHUB_REF_NAME}" > notes.md
+          fi
+
+      - name: 建立 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md
