@@ -11,6 +11,7 @@ bot 不直接跑萃取，新增/重查都交給 Celery 的 check_product。
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
@@ -65,7 +66,8 @@ WELCOME_TEXT = (
     "/track — 新增追蹤（接著貼網址）\n"
     "/list — 我的追蹤清單\n"
     "/untrack — 取消追蹤\n"
-    "/interval — 設定檢查間隔\n"
+    "/interval — 設定檢查頻率（分鐘／整點）\n"
+    "/refresh — 立即重爬我追蹤的所有商品\n"
     "/status — 查看狀態與價格歷史\n"
     "/cancel — 取消目前操作"
 )
@@ -191,6 +193,8 @@ def _list_products(telegram_id: int) -> list[dict]:
                 "currency": p.currency,
                 "status": p.status.value,
                 "last_checked_at": p.last_checked_at,
+                "schedule_mode": p.schedule_mode,
+                "check_interval_sec": p.check_interval_sec,
             }
             for p in sorted(user.products, key=lambda x: x.id)
         ]
@@ -210,7 +214,9 @@ def _remove_product(telegram_id: int, product_id: int) -> bool:
         return True
 
 
-def _set_interval(telegram_id: int, product_id: int, minutes: int) -> bool:
+def _set_schedule(
+    telegram_id: int, product_id: int, mode: str, minutes: int | None = None
+) -> bool:
     with session_scope() as s:
         product = (
             s.query(TrackedProduct)
@@ -220,11 +226,32 @@ def _set_interval(telegram_id: int, product_id: int, minutes: int) -> bool:
         )
         if product is None:
             return False
-        product.check_interval_sec = max(60, minutes * 60)
+        product.schedule_mode = mode
+        if mode == "interval" and minutes:
+            product.check_interval_sec = max(60, minutes * 60)
         if product.status == ProductStatus.ERROR:
             product.status = ProductStatus.ACTIVE
             product.consecutive_failures = 0
         return True
+
+
+def _manual_refresh(telegram_id: int) -> tuple[str, object]:
+    """手動重爬。回傳 (kind, payload)：
+    'ok'→payload=商品 id 清單；'cooldown'→payload=剩餘秒數；'empty'→payload=None。
+    """
+    with session_scope() as s:
+        user = s.query(User).filter_by(telegram_id=telegram_id).one_or_none()
+        if user is None or not user.products:
+            return "empty", None
+        now = dt.datetime.now(dt.timezone.utc)
+        cd = settings.manual_refresh_cooldown_sec
+        last = user.last_manual_refresh_at
+        if last is not None:
+            elapsed = (now - last).total_seconds()
+            if elapsed < cd:
+                return "cooldown", int(cd - elapsed)
+        user.last_manual_refresh_at = now
+        return "ok", [p.id for p in user.products]
 
 
 def _price_history(telegram_id: int, product_id: int) -> dict | None:
@@ -251,6 +278,8 @@ def _price_history(telegram_id: int, product_id: int) -> dict | None:
             "currency": product.currency,
             "current": product.current_price,
             "last_checked_at": product.last_checked_at,
+            "schedule_mode": product.schedule_mode,
+            "check_interval_sec": product.check_interval_sec,
             "points": [(r.checked_at, r.price) for r in rows],
         }
 
@@ -324,8 +353,10 @@ def _format_products(products: list[dict]) -> str:
         title = p["title"] or p["url"]
         site = site_label(p.get("domain"))
         checked = _fmt_checked(p.get("last_checked_at"))
+        freq = _fmt_freq(p.get("schedule_mode"), p.get("check_interval_sec"))
         lines.append(
-            f"#{p['id']}｜{site}｜{p['status']}｜{price}\n{title}\n🕒 最近爬文：{checked}"
+            f"#{p['id']}｜{site}｜{p['status']}｜{price}\n{title}\n"
+            f"🕒 最近爬文：{checked}｜⏱ {freq}"
         )
     return "\n\n".join(lines)
 
@@ -375,6 +406,18 @@ def _fmt_checked(checked_at) -> str:
     if checked_at is None:
         return "尚未檢查"
     return checked_at.astimezone(_TZ).strftime("%m/%d %H:%M")
+
+
+def _fmt_freq(mode: str | None, interval_sec: int | None) -> str:
+    if mode == "hourly":
+        return "每整點"
+    minutes = (interval_sec or 0) // 60
+    return f"每 {minutes} 分鐘"
+
+
+def _fmt_remain(seconds: int) -> str:
+    m, s = divmod(max(0, seconds), 60)
+    return f"{m} 分 {s} 秒" if m else f"{s} 秒"
 
 
 def _fmt_price(price: float | None, currency: str | None) -> str:
@@ -478,6 +521,25 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             tag = " ⛔未開通"
         lines.append(f"• {r['telegram_id']} {_display_name(r)}{tag}")
     await update.message.reply_text("\n".join(lines))
+
+
+async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    kind, payload = await asyncio.to_thread(_manual_refresh, update.effective_user.id)
+    if kind == "empty":
+        await update.message.reply_text("目前沒有追蹤任何商品。用 /track 新增。")
+        return
+    if kind == "cooldown":
+        await update.message.reply_text(
+            f"⏳ 剛剛才手動重爬過，請 {_fmt_remain(int(payload))} 後再試"
+            f"（每 {settings.manual_refresh_cooldown_sec // 60} 分鐘限一次）。"
+        )
+        return
+    ids = payload
+    for pid in ids:
+        _enqueue_check(pid)
+    await update.message.reply_text(
+        f"🔄 已手動觸發重爬 {len(ids)} 個商品，有變動會再通知你。"
+    )
 
 
 async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -592,6 +654,7 @@ async def status_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"狀態：{data['status']}",
         f"現在：{_fmt_price(data['current'], currency)}",
         f"🕒 最近爬文：{_fmt_checked(data.get('last_checked_at'))}",
+        f"⏱ 頻率：{_fmt_freq(data.get('schedule_mode'), data.get('check_interval_sec'))}",
     ]
     if points:
         ys = [p[1] for p in points]
@@ -616,12 +679,15 @@ async def status_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# ----------------------- 對話：/interval（兩步）-----------------------
+# ----------------------- 對話：/interval（設定檢查頻率，兩步）-----------------------
+
+_HOURLY_WORDS = {"整點", "正點", "hourly", "hour", "h"}
+
 
 async def interval_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await _show_list_or_end(update, update.effective_user.id) is None:
         return ConversationHandler.END
-    await update.message.reply_text(f"請輸入要「調整檢查間隔」的編號。\n{_HINT}")
+    await update.message.reply_text(f"請輸入要「調整檢查頻率」的編號。\n{_HINT}")
     return ASK_INTERVAL_ID
 
 
@@ -631,26 +697,44 @@ async def interval_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await update.message.reply_text(f"請輸入數字編號。\n{_HINT}")
         return ASK_INTERVAL_ID
     context.user_data["interval_pid"] = int(text)
-    await update.message.reply_text(f"請輸入新的檢查間隔（分鐘，最少 1）。\n{_HINT}")
+    await update.message.reply_text(
+        "請設定檢查頻率：\n"
+        "・輸入分鐘數（例：60）＝每 N 分鐘檢查（最少 1）\n"
+        "・輸入「整點」＝每小時整點（xx:00）檢查\n"
+        f"{_HINT}"
+    )
     return ASK_INTERVAL_MIN
 
 
 async def interval_minutes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
-    if not text.isdigit() or int(text) < 1:
-        await update.message.reply_text(f"請輸入大於等於 1 的分鐘數。\n{_HINT}")
-        return ASK_INTERVAL_MIN
-    pid = context.user_data.pop("interval_pid", None)
+    pid = context.user_data.get("interval_pid")
     if pid is None:
         await update.message.reply_text("操作已失效，請重新使用 /interval。")
         return ConversationHandler.END
-    ok = await asyncio.to_thread(
-        _set_interval, update.effective_user.id, pid, int(text)
-    )
-    await update.message.reply_text(
-        f"已將 #{pid} 的檢查間隔設為每 {int(text)} 分鐘。" if ok else "找不到該編號的商品。"
-    )
-    return ConversationHandler.END
+
+    if text.lower() in _HOURLY_WORDS:
+        ok = await asyncio.to_thread(
+            _set_schedule, update.effective_user.id, pid, "hourly"
+        )
+        context.user_data.pop("interval_pid", None)
+        await update.message.reply_text(
+            f"已將 #{pid} 設為每小時整點檢查。" if ok else "找不到該編號的商品。"
+        )
+        return ConversationHandler.END
+
+    if text.isdigit() and int(text) >= 1:
+        ok = await asyncio.to_thread(
+            _set_schedule, update.effective_user.id, pid, "interval", int(text)
+        )
+        context.user_data.pop("interval_pid", None)
+        await update.message.reply_text(
+            f"已將 #{pid} 設為每 {int(text)} 分鐘檢查。" if ok else "找不到該編號的商品。"
+        )
+        return ConversationHandler.END
+
+    await update.message.reply_text(f"請輸入分鐘數（如 60）或「整點」。\n{_HINT}")
+    return ASK_INTERVAL_MIN
 
 
 # ----------------------- 對話：/allow（管理員開通白名單）-----------------------
@@ -719,7 +803,8 @@ COMMANDS = [
     BotCommand("track", "新增追蹤商品"),
     BotCommand("list", "我的追蹤清單"),
     BotCommand("untrack", "取消追蹤"),
-    BotCommand("interval", "設定檢查間隔"),
+    BotCommand("interval", "設定檢查頻率（分鐘／整點）"),
+    BotCommand("refresh", "立即重爬我追蹤的所有商品"),
     BotCommand("status", "查看狀態與價格歷史"),
     BotCommand("version", "查看版本與更新內容"),
     BotCommand("cancel", "取消目前操作"),
@@ -766,6 +851,7 @@ def build_application() -> Application:
     # 簡單指令
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("list", list_cmd))
+    app.add_handler(CommandHandler("refresh", refresh_cmd))
     app.add_handler(CommandHandler("version", version_cmd))
     app.add_handler(CommandHandler("pending", pending_cmd))
     app.add_handler(CommandHandler("users", users_cmd))

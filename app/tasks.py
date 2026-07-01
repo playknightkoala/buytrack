@@ -6,7 +6,7 @@ import datetime as dt
 import html
 import logging
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 
 from app.alerts import notify_admins, send_message
 from app.celery_app import celery_app
@@ -32,11 +32,22 @@ def _utcnow() -> dt.datetime:
 @celery_app.task(name="app.tasks.enqueue_due_checks")
 def enqueue_due_checks() -> int:
     """掃描到期的 active 商品，逐一排入 check_product。回傳排入數量。"""
-    # 到期條件：從未檢查過，或距離上次檢查已超過該商品的間隔秒數
+    # 到期條件（依排程模式）：
+    #  - 從未檢查過
+    #  - interval：距上次檢查超過該商品的間隔秒數
+    #  - hourly：進入了新的整點（now 的小時 > 上次檢查的小時；UTC 整點=台北整點）
     due = or_(
         TrackedProduct.last_checked_at.is_(None),
-        func.extract("epoch", func.now() - TrackedProduct.last_checked_at)
-        >= TrackedProduct.check_interval_sec,
+        and_(
+            TrackedProduct.schedule_mode == "interval",
+            func.extract("epoch", func.now() - TrackedProduct.last_checked_at)
+            >= TrackedProduct.check_interval_sec,
+        ),
+        and_(
+            TrackedProduct.schedule_mode == "hourly",
+            func.date_trunc("hour", func.now())
+            > func.date_trunc("hour", TrackedProduct.last_checked_at),
+        ),
     )
     with session_scope() as session:
         rows = session.execute(

@@ -49,6 +49,9 @@ class User(Base):
     last_name: Mapped[str | None] = mapped_column(String(128), default=None)
     is_admin: Mapped[bool] = mapped_column(default=False)
     is_whitelisted: Mapped[bool] = mapped_column(default=False)  # 動態白名單（可由管理員開通）
+    last_manual_refresh_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )  # 手動 /refresh 的冷卻計時
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -74,6 +77,8 @@ class TrackedProduct(Base):
         index=True,
     )
     check_interval_sec: Mapped[int] = mapped_column(Integer, default=3600)
+    # 排程模式：interval=每 N 秒；hourly=每小時整點
+    schedule_mode: Mapped[str] = mapped_column(String(16), default="interval")
     last_checked_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), default=None, index=True
     )

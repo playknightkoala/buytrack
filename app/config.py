@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     min_domain_interval_sec: float = 8.0
     max_consecutive_failures: int = 5
     enqueue_period_sec: int = 60
+    manual_refresh_cooldown_sec: int = 300  # /refresh 每人冷卻時間
 
     # 萃取
     request_timeout_sec: float = 20.0
