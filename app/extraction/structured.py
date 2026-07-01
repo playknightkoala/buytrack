@@ -92,41 +92,62 @@ def _offer_price(offer: dict) -> tuple[float | None, str | None, Availability]:
     return price, currency, avail
 
 
+def _segments(obj: dict) -> list[str]:
+    return [t.split("/")[-1] for t in _types(obj)]
+
+
+def _clean_name(obj: dict) -> str | None:
+    name = obj.get("name")
+    return name.strip() if isinstance(name, str) and name.strip() else None
+
+
 def _from_jsonld_like(items: list, method: str) -> ExtractionResult | None:
-    title: str | None = None
     objects = [obj for item in items for obj in _walk(item)]
 
-    # 先抓 Product 的標題
+    # 標題優先序：ProductGroup 名稱 > 一般 Product 名稱。
+    # （momo 等站把商品拆成多個「變體 Product」，其 name 是顏色/規格如「黑色」，
+    #   真正的商品名在沒有價格的 ProductGroup 上。）
+    group_name: str | None = None
+    product_name: str | None = None
     for obj in objects:
-        if any("product" in t.lower() for t in _types(obj)):
-            name = obj.get("name")
-            if isinstance(name, str) and name.strip():
-                title = name.strip()
-            offers = obj.get("offers")
-            for offer in _aslist(offers):
-                if not isinstance(offer, dict):
-                    continue
-                price, currency, avail = _offer_price(offer)
-                if price is not None:
-                    return ExtractionResult(
-                        supported=True,
-                        price=price,
-                        currency=currency,
-                        title=title,
-                        availability=avail,
-                        method=method,
-                    )
+        segs = _segments(obj)
+        name = _clean_name(obj)
+        if not name:
+            continue
+        if "ProductGroup" in segs and group_name is None:
+            group_name = name
+        elif "Product" in segs and product_name is None:
+            product_name = name
+
+    # 找第一個帶價格的 Product / ProductGroup
+    for obj in objects:
+        if not any(s in ("Product", "ProductGroup") for s in _segments(obj)):
+            continue
+        for offer in _aslist(obj.get("offers")):
+            if not isinstance(offer, dict):
+                continue
+            price, currency, avail = _offer_price(offer)
+            if price is not None:
+                title = group_name or _clean_name(obj) or product_name
+                return ExtractionResult(
+                    supported=True,
+                    price=price,
+                    currency=currency,
+                    title=title,
+                    availability=avail,
+                    method=method,
+                )
 
     # 退而求其次：任何 Offer / AggregateOffer 物件
     for obj in objects:
-        if any(t.split("/")[-1] in ("Offer", "AggregateOffer") for t in _types(obj)):
+        if any(s in ("Offer", "AggregateOffer") for s in _segments(obj)):
             price, currency, avail = _offer_price(obj)
             if price is not None:
                 return ExtractionResult(
                     supported=True,
                     price=price,
                     currency=currency,
-                    title=title,
+                    title=group_name or product_name,
                     availability=avail,
                     method=method,
                 )
