@@ -14,6 +14,7 @@ from app.config import settings
 from app.db import session_scope
 from app.extraction.adapters.base import Availability
 from app.extraction.pipeline import extract_price
+from app.sites import site_label
 from app.models import (
     PriceHistory,
     ProductStatus,
@@ -170,12 +171,13 @@ def check_product(product_id: int) -> None:
         if old_price is None or new_price != old_price or old_status != ProductStatus.ACTIVE:
             _add_history(session, product_id, new_price, result.availability)
 
+        site = _h(site_label(domain))
         if old_price is None:
             # 首次取得價格
             product.current_price = new_price
             send_message(
                 chat_id,
-                f"✅ 已開始追蹤：\n<b>{_h(product.title or url)}</b>\n"
+                f"✅ 已開始追蹤（{site}）：\n<b>{_h(product.title or url)}</b>\n"
                 f"目前價格：{_money(new_price, product.currency)}",
             )
         elif new_price is not None and new_price != old_price:
@@ -183,7 +185,7 @@ def check_product(product_id: int) -> None:
             product.current_price = new_price
             send_message(
                 chat_id,
-                f"{arrow}\n<b>{_h(product.title or url)}</b>\n"
+                f"{arrow}（{site}）\n<b>{_h(product.title or url)}</b>\n"
                 f"{_money(old_price, product.currency)} → "
                 f"<b>{_money(new_price, product.currency)}</b>\n{_h(url)}",
             )
