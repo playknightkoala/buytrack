@@ -21,7 +21,6 @@ from app.models import (
     RequestStatus,
     TrackedProduct,
     UnsupportedRequest,
-    User,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,25 +37,25 @@ def enqueue_due_checks() -> int:
     #  - 從未檢查過
     #  - interval：距上次檢查超過該商品的間隔秒數
     #  - hourly：進入了新的整點（now 的小時 > 上次檢查的小時；UTC 整點=台北整點）
-    # 排程設定在使用者身上（套用其所有商品）
+    # 排程設定在每個商品上
     due = or_(
         TrackedProduct.last_checked_at.is_(None),
         and_(
-            User.schedule_mode == "interval",
+            TrackedProduct.schedule_mode == "interval",
             func.extract("epoch", func.now() - TrackedProduct.last_checked_at)
-            >= User.check_interval_sec,
+            >= TrackedProduct.check_interval_sec,
         ),
         and_(
-            User.schedule_mode == "hourly",
+            TrackedProduct.schedule_mode == "hourly",
             func.date_trunc("hour", func.now())
             > func.date_trunc("hour", TrackedProduct.last_checked_at),
         ),
     )
     with session_scope() as session:
         rows = session.execute(
-            select(TrackedProduct.id)
-            .join(User)
-            .where(TrackedProduct.status == ProductStatus.ACTIVE, due)
+            select(TrackedProduct.id).where(
+                TrackedProduct.status == ProductStatus.ACTIVE, due
+            )
         ).all()
         ids = [r[0] for r in rows]
     for product_id in ids:
