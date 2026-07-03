@@ -16,10 +16,17 @@ import logging
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
-from telegram import BotCommand, BotCommandScopeChat, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
@@ -663,101 +670,131 @@ async def status_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# ----------------------- 對話：/interval（設定檢查頻率，兩步）-----------------------
+# ----------------------- 對話：/interval（按鈕選項式）-----------------------
 
-_HOURLY_WORDS = {"整點", "正點", "hourly", "hour", "h"}
+# 頻率預設選項（分鐘）
+_FREQ_PRESETS = [
+    [("15 分", 15), ("30 分", 30), ("1 小時", 60)],
+    [("3 小時", 180), ("6 小時", 360), ("12 小時", 720)],
+    [("24 小時", 1440)],
+]
 
 
-_ALL_WORDS = {"全部", "所有", "all", "a"}
-_SPECIFIC_WORDS = {"指定", "選擇", "specific", "s"}
+def _btn(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text, callback_data=data)
 
 
-def _parse_ids(text: str) -> list[int]:
-    raw = text
-    for ch in (",", "，", "、", "#", "\n"):
-        raw = raw.replace(ch, " ")
-    return [int(x) for x in raw.split() if x.isdigit()]
+def _scope_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [_btn("全部商品", "scope:all"), _btn("指定商品", "scope:specific")],
+            [_btn("✖ 取消", "iv:cancel")],
+        ]
+    )
+
+
+def _ids_keyboard(products: list[tuple[int, str]], selected: set[int]) -> InlineKeyboardMarkup:
+    rows = [
+        [_btn(f"{'✅' if pid in selected else '▫️'} {label}", f"tg:{pid}")]
+        for pid, label in products
+    ]
+    rows.append([_btn("✔ 完成", "ids:done"), _btn("✖ 取消", "iv:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _freq_keyboard() -> InlineKeyboardMarkup:
+    rows = [[_btn(t, f"fq:{m}") for t, m in row] for row in _FREQ_PRESETS]
+    rows.append([_btn("每整點", "fq:hourly")])
+    rows.append([_btn("✖ 取消", "iv:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _short_label(p: dict) -> str:
+    title = p.get("title") or p.get("url") or ""
+    return f"#{p['id']} {title[:16]}"
 
 
 async def interval_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
     await update.message.reply_text(
-        "要調整哪些商品的檢查頻率？\n"
-        "・輸入「全部」＝套用所有追蹤商品\n"
-        "・輸入「指定」＝選擇特定商品（可多選）\n"
-        f"{_HINT}"
+        "要調整哪些商品的檢查頻率？", reply_markup=_scope_keyboard()
     )
     return ASK_INTERVAL_SCOPE
 
 
-async def interval_scope(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip().lower()
-    if text in _ALL_WORDS:
+async def interval_scope_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    if q.data == "scope:all":
         context.user_data["interval_target"] = "all"
-        return await _prompt_freq(update)
-    if text in _SPECIFIC_WORDS:
-        products = await asyncio.to_thread(_list_products, update.effective_user.id)
-        if not products:
-            await update.message.reply_text("目前沒有追蹤任何商品。用 /track 新增。")
-            return ConversationHandler.END
-        await update.message.reply_text(
-            _format_products(products), disable_web_page_preview=True
-        )
-        await update.message.reply_text(
-            f"請輸入要調整的商品編號（可多選，用空格或逗號分隔，例：1 3 5）。\n{_HINT}"
-        )
-        return ASK_INTERVAL_IDS
-    await update.message.reply_text(f"請輸入「全部」或「指定」。\n{_HINT}")
-    return ASK_INTERVAL_SCOPE
+        await q.edit_message_text("範圍：全部商品")
+        await q.message.reply_text("請選擇檢查頻率：", reply_markup=_freq_keyboard())
+        return ASK_INTERVAL_MIN
 
-
-async def interval_ids(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    ids = _parse_ids(update.message.text)
-    products = await asyncio.to_thread(_list_products, update.effective_user.id)
-    owned = {p["id"] for p in products}
-    selected = [i for i in ids if i in owned]
-    if not selected:
-        await update.message.reply_text(
-            f"沒有對應的編號，請重新輸入（例：1 3 5）。\n{_HINT}"
-        )
-        return ASK_INTERVAL_IDS
-    context.user_data["interval_target"] = selected
-    return await _prompt_freq(update)
-
-
-async def _prompt_freq(update: Update) -> int:
-    await update.message.reply_text(
-        "請設定檢查頻率：\n"
-        "・輸入分鐘數（例：60）＝每 N 分鐘檢查（最少 1）\n"
-        "・輸入「整點」＝每小時整點（xx:00）檢查\n"
-        f"{_HINT}"
+    products = await asyncio.to_thread(_list_products, q.from_user.id)
+    if not products:
+        await q.edit_message_text("目前沒有追蹤任何商品。用 /track 新增。")
+        return ConversationHandler.END
+    context.user_data["interval_products"] = [(p["id"], _short_label(p)) for p in products]
+    context.user_data["interval_sel"] = set()
+    await q.edit_message_text(
+        "請選擇要調整的商品（可多選），選好按「完成」：",
+        reply_markup=_ids_keyboard(context.user_data["interval_products"], set()),
     )
+    return ASK_INTERVAL_IDS
+
+
+async def interval_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    pid = int(q.data.split(":")[1])
+    sel: set[int] = context.user_data.setdefault("interval_sel", set())
+    sel.discard(pid) if pid in sel else sel.add(pid)
+    await q.edit_message_reply_markup(
+        reply_markup=_ids_keyboard(context.user_data.get("interval_products", []), sel)
+    )
+    return ASK_INTERVAL_IDS
+
+
+async def interval_ids_done_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    sel = context.user_data.get("interval_sel") or set()
+    if not sel:
+        await q.answer("尚未選擇任何商品", show_alert=True)
+        return ASK_INTERVAL_IDS
+    await q.answer()
+    context.user_data["interval_target"] = list(sel)
+    await q.edit_message_text(f"已選擇 {len(sel)} 個商品。")
+    await q.message.reply_text("請選擇檢查頻率：", reply_markup=_freq_keyboard())
     return ASK_INTERVAL_MIN
 
 
-async def interval_minutes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
+async def interval_freq_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
     target = context.user_data.get("interval_target")
     if target is None:
-        await update.message.reply_text("操作已失效，請重新使用 /interval。")
+        await q.edit_message_text("操作已失效，請重新使用 /interval。")
         return ConversationHandler.END
-
-    product_ids = None if target == "all" else target
-
-    if text.lower() in _HOURLY_WORDS:
-        mode, minutes = "hourly", None
-    elif text.isdigit() and int(text) >= 1:
-        mode, minutes = "interval", int(text)
+    data = q.data.split(":")[1]
+    if data == "hourly":
+        mode, minutes, freq_desc = "hourly", None, "每小時整點"
     else:
-        await update.message.reply_text(f"請輸入分鐘數（如 60）或「整點」。\n{_HINT}")
-        return ASK_INTERVAL_MIN
-
-    n = await asyncio.to_thread(
-        _set_schedule, update.effective_user.id, mode, minutes, product_ids
-    )
-    context.user_data.pop("interval_target", None)
+        mode, minutes = "interval", int(data)
+        freq_desc = f"每 {minutes} 分鐘"
+    product_ids = None if target == "all" else target
+    n = await asyncio.to_thread(_set_schedule, q.from_user.id, mode, minutes, product_ids)
     scope_desc = "全部商品" if target == "all" else f"{n} 個指定商品"
-    freq_desc = "每小時整點" if mode == "hourly" else f"每 {minutes} 分鐘"
-    await update.message.reply_text(f"已將{scope_desc}設為{freq_desc}檢查。")
+    context.user_data.clear()
+    await q.edit_message_text(f"✅ 已將{scope_desc}設為{freq_desc}檢查。")
+    return ConversationHandler.END
+
+
+async def interval_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    context.user_data.clear()
+    await q.edit_message_text("已取消。")
     return ConversationHandler.END
 
 
@@ -885,14 +922,30 @@ def build_application() -> Application:
     app.add_handler(_conversation("untrack", untrack_start, {ASK_ID: [MessageHandler(_TEXT, untrack_id)]}))
     app.add_handler(_conversation("status", status_start, {ASK_STATUS_ID: [MessageHandler(_TEXT, status_id)]}))
     app.add_handler(
-        _conversation(
-            "interval",
-            interval_start,
-            {
-                ASK_INTERVAL_SCOPE: [MessageHandler(_TEXT, interval_scope)],
-                ASK_INTERVAL_IDS: [MessageHandler(_TEXT, interval_ids)],
-                ASK_INTERVAL_MIN: [MessageHandler(_TEXT, interval_minutes)],
+        ConversationHandler(
+            entry_points=[CommandHandler("interval", interval_start)],
+            states={
+                ASK_INTERVAL_SCOPE: [
+                    CallbackQueryHandler(interval_scope_cb, pattern="^scope:")
+                ],
+                ASK_INTERVAL_IDS: [
+                    CallbackQueryHandler(interval_toggle_cb, pattern="^tg:"),
+                    CallbackQueryHandler(interval_ids_done_cb, pattern="^ids:done$"),
+                ],
+                ASK_INTERVAL_MIN: [
+                    CallbackQueryHandler(interval_freq_cb, pattern="^fq:")
+                ],
+                ConversationHandler.TIMEOUT: [
+                    MessageHandler(filters.ALL, on_timeout),
+                    CallbackQueryHandler(on_timeout),
+                ],
             },
+            fallbacks=[
+                CommandHandler("cancel", cancel),
+                CallbackQueryHandler(interval_cancel_cb, pattern="^iv:cancel$"),
+            ],
+            conversation_timeout=CONVERSATION_TIMEOUT,
+            allow_reentry=True,
         )
     )
     app.add_handler(_conversation("allow", allow_start, {ASK_ALLOW_ID: [MessageHandler(_TEXT, allow_id)]}))
