@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import html
 import logging
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
@@ -39,7 +40,7 @@ from app.broadcast import broadcast_if_new, changelog_for
 from app.config import settings
 from app.db import session_scope
 from app.extraction.context import domain_of
-from app.sites import site_label
+from app.sites import short_link, site_label
 from app.version import __version__
 from app.models import (
     PriceHistory,
@@ -361,17 +362,19 @@ def _enqueue_check(product_id: int) -> None:
 
 
 def _format_products(products: list[dict]) -> str:
+    """組出 /list 內容（HTML 模式：文字已跳脫；網址過長會縮短顯示、仍可點擊）。"""
     lines = []
     for p in products:
         price = "—"
         if p["price"] is not None:
             price = f"{p['price']:,.0f} {p['currency'] or ''}".strip()
-        title = p["title"] or p["url"]
-        site = site_label(p.get("domain"))
+        title = html.escape(p["title"]) if p["title"] else "（尚未取得商品名稱）"
+        site = html.escape(site_label(p.get("domain")))
         checked = _fmt_checked(p.get("last_checked_at"))
         freq = _fmt_freq(p.get("schedule_mode"), p.get("check_interval_sec"))
         lines.append(
             f"#{p['id']}｜{site}｜{p['status']}｜{price}\n{title}\n"
+            f"🔗 {short_link(p['url'])}\n"
             f"🕒 最近爬文：{checked}｜⏱ {freq}"
         )
     return "\n\n".join(lines)
@@ -383,7 +386,9 @@ async def _show_list_or_end(update: Update, uid: int) -> list[dict] | None:
     if not products:
         await update.message.reply_text("目前沒有追蹤任何商品。用 /track 新增。")
         return None
-    await update.message.reply_text(_format_products(products), disable_web_page_preview=True)
+    await update.message.reply_text(
+        _format_products(products), parse_mode="HTML", disable_web_page_preview=True
+    )
     return products
 
 
@@ -490,7 +495,7 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("目前沒有追蹤任何商品。用 /track 新增。")
         return
     await update.message.reply_text(
-        _format_products(products), disable_web_page_preview=True
+        _format_products(products), parse_mode="HTML", disable_web_page_preview=True
     )
 
 
