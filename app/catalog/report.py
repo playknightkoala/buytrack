@@ -31,7 +31,7 @@ h2{font-size:14px;border-left:4px solid #1ab6b6;padding-left:8px;margin:22px 0 8
 table{width:100%;border-collapse:collapse}
 th{background:#f5f5f5;text-align:left;font-size:10px;color:#666}
 td,th{border-bottom:1px solid #e3e3e3;padding:5px 6px;vertical-align:middle}
-img{width:110px;height:110px;object-fit:cover;border-radius:6px}
+img{width:150px;height:150px;object-fit:cover;border-radius:6px}
 a{color:#1a73e8;text-decoration:none;word-break:break-all}
 .price{white-space:nowrap;font-weight:bold}
 .old{color:#999;text-decoration:line-through;font-weight:normal}
@@ -42,7 +42,7 @@ a{color:#1a73e8;text-decoration:none;word-break:break-all}
 
 
 async def fetch_image_data(
-    urls: list[str | None], max_px: int = 240, quality: int = 80, concurrency: int = 8
+    urls: list[str | None], max_px: int = 320, quality: int = 80, concurrency: int = 8
 ) -> dict[str, str]:
     """下載商品圖並縮到顯示尺寸、壓成 JPEG data URI。
 
