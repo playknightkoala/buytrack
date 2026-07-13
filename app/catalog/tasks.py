@@ -14,7 +14,7 @@ from app.alerts import notify_admins, send_document, send_message
 from app.catalog.base import CatalogItem
 from app.catalog.differ import CatalogDiff, diff_catalog
 from app.catalog.registry import get_catalog_adapter
-from app.catalog.report import build_report_html, html_to_pdf
+from app.catalog.report import render_report
 from app.celery_app import celery_app
 from app.config import settings
 from app.db import session_scope
@@ -145,8 +145,7 @@ def _send_report(
     baseline: bool,
 ) -> None:
     try:
-        html_content = build_report_html(label, domain, diff, items, baseline=baseline)
-        pdf = asyncio.run(html_to_pdf(html_content))
+        pdf = asyncio.run(render_report(label, domain, diff, items, baseline=baseline))
     except Exception:
         logger.exception("PDF 產出失敗（改發文字摘要） label=%s", label)
         send_message(chat_id, _caption(label, diff, items, baseline) + "\n（報告產出失敗，已記錄）")

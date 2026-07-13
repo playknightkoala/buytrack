@@ -5,14 +5,21 @@
 """
 from __future__ import annotations
 
+import asyncio
+import base64
 import datetime as dt
 import html
+import io
+import logging
 from zoneinfo import ZoneInfo
 
+import httpx
 from playwright.async_api import async_playwright
 
 from app.catalog.base import CatalogItem
 from app.catalog.differ import CatalogDiff
+
+logger = logging.getLogger(__name__)
 
 _TZ = ZoneInfo("Asia/Taipei")
 
@@ -24,7 +31,7 @@ h2{font-size:14px;border-left:4px solid #1ab6b6;padding-left:8px;margin:22px 0 8
 table{width:100%;border-collapse:collapse}
 th{background:#f5f5f5;text-align:left;font-size:10px;color:#666}
 td,th{border-bottom:1px solid #e3e3e3;padding:5px 6px;vertical-align:middle}
-img{width:52px;height:52px;object-fit:cover;border-radius:4px}
+img{width:110px;height:110px;object-fit:cover;border-radius:6px}
 a{color:#1a73e8;text-decoration:none;word-break:break-all}
 .price{white-space:nowrap;font-weight:bold}
 .old{color:#999;text-decoration:line-through;font-weight:normal}
@@ -34,14 +41,52 @@ a{color:#1a73e8;text-decoration:none;word-break:break-all}
 """
 
 
+async def fetch_image_data(
+    urls: list[str | None], max_px: int = 240, quality: int = 80, concurrency: int = 8
+) -> dict[str, str]:
+    """下載商品圖並縮到顯示尺寸、壓成 JPEG data URI。
+
+    直接讓 Chromium 嵌原圖會產生巨大 PDF（原圖以近無損方式嵌入）；
+    先縮圖再內嵌可把整份報告控制在幾 MB 內，且不必等遠端圖片載入。
+    失敗的圖片略過（HTML 端 fallback 回原網址）。
+    """
+    from PIL import Image  # 由 matplotlib 相依提供
+
+    out: dict[str, str] = {}
+    sem = asyncio.Semaphore(concurrency)
+    unique = [u for u in dict.fromkeys(urls) if u]
+
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        async def one(url: str) -> None:
+            async with sem:
+                try:
+                    r = await client.get(url)
+                    r.raise_for_status()
+                    im = Image.open(io.BytesIO(r.content)).convert("RGB")
+                    im.thumbnail((max_px, max_px))
+                    buf = io.BytesIO()
+                    im.save(buf, "JPEG", quality=quality)
+                    out[url] = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+                except Exception:
+                    logger.info("縮圖失敗，改用原網址：%s", url)
+
+        await asyncio.gather(*(one(u) for u in unique))
+    return out
+
+
 def _money(value: float | None) -> str:
     return f"{value:,.0f}" if value is not None else "—"
+
+
+# build_report_html 期間使用的圖片對應（url -> data URI）
+_IMAGE_DATA: dict[str, str] = {}
 
 
 def _img(item: CatalogItem) -> str:
     if not item.image_url:
         return ""
-    return f'<img src="{html.escape(item.image_url, quote=True)}">'
+    src = _IMAGE_DATA.get(item.image_url, item.image_url)
+    return f'<img src="{html.escape(src, quote=True)}">'
 
 
 def _link(item: CatalogItem) -> str:
@@ -77,7 +122,10 @@ def build_report_html(
     diff: CatalogDiff,
     all_items: list[CatalogItem],
     baseline: bool = False,
+    image_data: dict[str, str] | None = None,
 ) -> str:
+    global _IMAGE_DATA
+    _IMAGE_DATA = image_data or {}
     now = dt.datetime.now(_TZ).strftime("%Y-%m-%d %H:%M")
     parts = [f"<style>{_CSS}</style>"]
     parts.append(f"<h1>📦 {html.escape(label)}</h1>")
@@ -116,13 +164,13 @@ def build_report_html(
 
 
 async def html_to_pdf(html_content: str) -> bytes:
-    """以 Chromium 將 HTML 轉為 A4 PDF（等待遠端商品圖載入）。"""
+    """以 Chromium 將 HTML 轉為 A4 PDF（圖片已內嵌 data URI，無需等遠端載入）。"""
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         try:
             page = await browser.new_page()
             await page.set_content(html_content, wait_until="load", timeout=60_000)
-            await page.wait_for_timeout(2500)  # 給商品圖一點載入時間
+            await page.wait_for_timeout(300)
             return await page.pdf(
                 format="A4",
                 print_background=True,
@@ -130,3 +178,18 @@ async def html_to_pdf(html_content: str) -> bytes:
             )
         finally:
             await browser.close()
+
+
+async def render_report(
+    label: str,
+    site: str,
+    diff: CatalogDiff,
+    all_items: list[CatalogItem],
+    baseline: bool = False,
+) -> bytes:
+    """一站式：縮圖內嵌 → 組 HTML → 產 PDF。"""
+    image_data = await fetch_image_data([i.image_url for i in all_items])
+    html_content = build_report_html(
+        label, site, diff, all_items, baseline=baseline, image_data=image_data
+    )
+    return await html_to_pdf(html_content)
