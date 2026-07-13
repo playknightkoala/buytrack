@@ -49,6 +49,7 @@ from app.models import (
     TrackedProduct,
     UnsupportedRequest,
     User,
+    WatchedCollection,
 )
 
 _TZ = ZoneInfo("Asia/Taipei")
@@ -67,7 +68,9 @@ CONVERSATION_TIMEOUT = 30  # 秒
     ASK_INTERVAL_MIN,
     ASK_STATUS_ID,
     ASK_ALLOW_ID,
-) = range(7)
+    ASK_WATCH_URL,
+    ASK_UNWATCH_ID,
+) = range(9)
 
 # 開通白名單後，傳給新使用者的歡迎訊息（也就是原本 /start 會回的內容）
 WELCOME_TEXT = (
@@ -299,6 +302,62 @@ def _price_history(telegram_id: int, product_id: int) -> dict | None:
             "check_interval_sec": product.check_interval_sec,
             "points": [(r.checked_at, r.price) for r in rows],
         }
+
+
+# ----------------------- 目錄訂閱 DB 操作 -----------------------
+
+def _add_watch(telegram_id: int, url: str, label: str) -> tuple[int, bool]:
+    """新增目錄訂閱。回傳 (watch_id, is_duplicate)。"""
+    user_id = _get_or_create_user(telegram_id)
+    target = _normalize_url(url)
+    with session_scope() as s:
+        for w in s.query(WatchedCollection).filter_by(user_id=user_id).all():
+            if _normalize_url(w.url) == target:
+                return w.id, True
+        watch = WatchedCollection(
+            user_id=user_id, url=url, domain=domain_of(url), label=label
+        )
+        s.add(watch)
+        s.flush()
+        return watch.id, False
+
+
+def _list_watches(telegram_id: int) -> list[dict]:
+    with session_scope() as s:
+        user = s.query(User).filter_by(telegram_id=telegram_id).one_or_none()
+        if user is None:
+            return []
+        rows = (
+            s.query(WatchedCollection)
+            .filter_by(user_id=user.id)
+            .order_by(WatchedCollection.id)
+            .all()
+        )
+        return [
+            {
+                "id": w.id,
+                "label": w.label or w.domain,
+                "url": w.url,
+                "status": w.status,
+                "count": sum(1 for p in w.products if p.is_active),
+                "last_crawled_at": w.last_crawled_at,
+            }
+            for w in rows
+        ]
+
+
+def _remove_watch(telegram_id: int, watch_id: int) -> bool:
+    with session_scope() as s:
+        watch = (
+            s.query(WatchedCollection)
+            .join(User)
+            .filter(WatchedCollection.id == watch_id, User.telegram_id == telegram_id)
+            .one_or_none()
+        )
+        if watch is None:
+            return False
+        s.delete(watch)
+        return True
 
 
 def _list_pending() -> list[dict]:
@@ -623,6 +682,98 @@ async def untrack_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+# ----------------------- 對話：/watch（訂閱網站目錄）-----------------------
+
+def _catalog_enqueue(watch_id: int) -> None:
+    from app.catalog.tasks import crawl_collection  # 延遲 import
+
+    crawl_collection.delay(watch_id)
+
+
+async def watch_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "請貼上要追蹤的「商品列表頁」網址（例如某分類頁，"
+        "支援 Shopify / Cyberbiz 系網站的 /collections/ 網址）。\n"
+        f"{_HINT}"
+    )
+    return ASK_WATCH_URL
+
+
+async def watch_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    url = update.message.text.strip()
+    if not _valid_url(url):
+        await update.message.reply_text(f"這不是有效的 http(s) 網址，請重貼。\n{_HINT}")
+        return ASK_WATCH_URL
+
+    from app.catalog.adapters.products_json import parse_collection
+    from app.catalog.registry import get_catalog_adapter
+
+    if get_catalog_adapter(url) is None:
+        await update.message.reply_text(
+            "此網站的目錄格式目前不支援（需為 /collections/ 列表頁，"
+            "或已支援的網站）。已通知管理員評估。"
+        )
+        from app.alerts import notify_admins
+
+        notify_admins(f"🆕 目錄訂閱請求（格式不支援）：\n{url}")
+        return ConversationHandler.END
+
+    parsed = parse_collection(url)
+    label = f"{domain_of(url)}/{parsed[1]}" if parsed else domain_of(url)
+    watch_id, dup = await asyncio.to_thread(
+        _add_watch, update.effective_user.id, url, label
+    )
+    if dup:
+        await update.message.reply_text(
+            f"⚠️ 你已經在追蹤這個目錄了（編號 W{watch_id}）。可用 /watchlist 查看。"
+        )
+        return ConversationHandler.END
+    _catalog_enqueue(watch_id)
+    await update.message.reply_text(
+        f"已加入目錄追蹤（編號 W{watch_id}），正在進行首次爬取建立基準快照，"
+        "完成後會傳送完整目錄 PDF 給你；之後每天早上 8 點自動比對新品與調價。"
+    )
+    return ConversationHandler.END
+
+
+async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    rows = await asyncio.to_thread(_list_watches, update.effective_user.id)
+    if not rows:
+        await update.message.reply_text("目前沒有訂閱任何目錄。用 /watch 新增。")
+        return
+    lines = []
+    for w in rows:
+        crawled = _fmt_checked(w["last_crawled_at"])
+        lines.append(
+            f"W{w['id']}｜{html.escape(w['label'])}｜{w['status']}｜{w['count']} 件\n"
+            f"🔗 {short_link(w['url'])}\n🕒 最近爬取：{crawled}"
+        )
+    await update.message.reply_text(
+        "\n\n".join(lines), parse_mode="HTML", disable_web_page_preview=True
+    )
+
+
+async def unwatch_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    rows = await asyncio.to_thread(_list_watches, update.effective_user.id)
+    if not rows:
+        await update.message.reply_text("目前沒有訂閱任何目錄。用 /watch 新增。")
+        return ConversationHandler.END
+    lines = [f"W{w['id']}｜{w['label']}｜{w['count']} 件" for w in rows]
+    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text(f"請輸入要取消的目錄編號（數字即可）。\n{_HINT}")
+    return ASK_UNWATCH_ID
+
+
+async def unwatch_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip().lstrip("Ww#")
+    if not text.isdigit():
+        await update.message.reply_text(f"請輸入數字編號。\n{_HINT}")
+        return ASK_UNWATCH_ID
+    ok = await asyncio.to_thread(_remove_watch, update.effective_user.id, int(text))
+    await update.message.reply_text("已取消目錄追蹤。" if ok else "找不到該編號的目錄。")
+    return ConversationHandler.END
+
+
 # ----------------------- 對話：/status -----------------------
 
 async def status_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -872,6 +1023,9 @@ COMMANDS = [
     BotCommand("interval", "設定檢查頻率（分鐘／整點）"),
     BotCommand("refresh", "立即重爬我追蹤的所有商品"),
     BotCommand("status", "查看狀態與價格歷史"),
+    BotCommand("watch", "訂閱網站目錄（新品/調價 PDF）"),
+    BotCommand("watchlist", "我的目錄訂閱"),
+    BotCommand("unwatch", "取消目錄訂閱"),
     BotCommand("version", "查看版本與更新內容"),
     BotCommand("cancel", "取消目前操作"),
 ]
@@ -918,6 +1072,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("refresh", refresh_cmd))
+    app.add_handler(CommandHandler("watchlist", watchlist_cmd))
     app.add_handler(CommandHandler("version", version_cmd))
     app.add_handler(CommandHandler("pending", pending_cmd))
     app.add_handler(CommandHandler("users", users_cmd))
@@ -954,6 +1109,8 @@ def build_application() -> Application:
         )
     )
     app.add_handler(_conversation("allow", allow_start, {ASK_ALLOW_ID: [MessageHandler(_TEXT, allow_id)]}))
+    app.add_handler(_conversation("watch", watch_start, {ASK_WATCH_URL: [MessageHandler(_TEXT, watch_url)]}))
+    app.add_handler(_conversation("unwatch", unwatch_start, {ASK_UNWATCH_ID: [MessageHandler(_TEXT, unwatch_id)]}))
     return app
 
 

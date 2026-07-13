@@ -13,6 +13,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -107,6 +108,78 @@ class PriceHistory(Base):
     )
 
     product: Mapped[TrackedProduct] = relationship(back_populates="history")
+
+
+class WatchedCollection(Base):
+    """使用者訂閱的「網站目錄」（例如某分類列表頁），每日爬取全目錄比對新品/調價。"""
+
+    __tablename__ = "watched_collections"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    url: Mapped[str] = mapped_column(Text)
+    domain: Mapped[str] = mapped_column(String(255), index=True)
+    label: Mapped[str | None] = mapped_column(String(255), default=None)  # 顯示名（如分類 handle）
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)  # active/error
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+    last_crawled_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    user: Mapped[User] = relationship()
+    products: Mapped[list["CatalogProduct"]] = relationship(
+        back_populates="collection", cascade="all, delete-orphan"
+    )
+
+
+class CatalogProduct(Base):
+    """目錄快照中的單一商品（以 key=商品相對網址 為唯一鍵）。"""
+
+    __tablename__ = "catalog_products"
+    __table_args__ = (UniqueConstraint("collection_id", "key", name="uq_catalog_product_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    collection_id: Mapped[int] = mapped_column(
+        ForeignKey("watched_collections.id", ondelete="CASCADE"), index=True
+    )
+    key: Mapped[str] = mapped_column(String(512))
+    title: Mapped[str | None] = mapped_column(Text, default=None)
+    price: Mapped[float | None] = mapped_column(Float, default=None)
+    compare_at_price: Mapped[float | None] = mapped_column(Float, default=None)
+    image_url: Mapped[str | None] = mapped_column(Text, default=None)
+    product_url: Mapped[str] = mapped_column(Text)
+    available: Mapped[bool | None] = mapped_column(default=None)
+    is_active: Mapped[bool] = mapped_column(default=True)  # 是否仍在目錄上
+    first_seen_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    last_seen_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    collection: Mapped[WatchedCollection] = relationship(back_populates="products")
+
+
+class CatalogChange(Base):
+    """每次爬取偵測到的變化紀錄（新品 / 調價）。"""
+
+    __tablename__ = "catalog_changes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    collection_id: Mapped[int] = mapped_column(
+        ForeignKey("watched_collections.id", ondelete="CASCADE"), index=True
+    )
+    key: Mapped[str] = mapped_column(String(512))
+    change_type: Mapped[str] = mapped_column(String(16))  # new / price
+    title: Mapped[str | None] = mapped_column(Text, default=None)
+    old_price: Mapped[float | None] = mapped_column(Float, default=None)
+    new_price: Mapped[float | None] = mapped_column(Float, default=None)
+    changed_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
 
 
 class AnnouncedVersion(Base):

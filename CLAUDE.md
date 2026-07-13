@@ -46,6 +46,18 @@
 - **管理員指令**（`/allow`、`/users`、`/pending`）只在管理員自己的選單顯示（`BotCommandScopeChat`），且 handler 內再次驗證 `admin_id_set`。`/allow` 開通後會立即私訊對方 `WELCOME_TEXT`。
 - 改動 `.env` 的 `ADMIN_IDS` 後需重啟 `bot` 讓 `_post_init` 重設選單。
 
+## 目錄追蹤（`app/catalog/`，v1.3 新增）
+- 使用者 `/watch <列表頁網址>` 訂閱整個網站目錄（如某分類頁）；**每日 08:00（台北）**全量爬取比對，
+  發現**新品/調價**時產出 **PDF 報告**（🆕 新增區 / 💰 調價區 / 📦 完整目錄區）用 `sendDocument` 通知。
+- **只撈列表資料、不進商品頁**：通用 adapter（`catalog/adapters/products_json.py`）優先打
+  Cyberbiz `search_products.json`（有 total_pages 正規翻頁），fallback Shopify `products.json`。
+  其他平台可仿照 extraction adapters 模式新增網域專屬 catalog adapter（自動註冊）。
+- PDF：`catalog/report.py` 用 HTML 模板 + Playwright `page.pdf()`（映像已裝 Noto CJK 字型）。
+- **獨立 `catalog` queue + `catalog-worker` 容器**（task_routes 路由），長時間爬取不影響單品檢查。
+- 首次訂閱＝建立基準快照並送完整目錄 PDF；之後**無變化不發訊息**；連續失敗 3 次標 `error` 並通知。
+- 資料表：`watched_collections` / `catalog_products`（快照，key=商品相對網址）/ `catalog_changes`。
+- 指令：`/watch`、`/watchlist`、`/unwatch`。
+
 ## 版本與發版
 - 版本單一來源：`app/version.py` 的 `__version__`（SemVer）；改版說明在 `CHANGELOG.md`；git tag `vX.Y.Z`。
 - bot 啟動時若偵測目前版本尚未公告，會把 CHANGELOG 對應段落**自動推播給已開通使用者**（`app/broadcast.py`，用 `announced_versions` 表去重）。

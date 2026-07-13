@@ -3,6 +3,11 @@ FROM mcr.microsoft.com/playwright/python:v1.48.0-noble
 
 WORKDIR /app
 
+# PDF 報告需要中日文字型（Chromium 渲染 HTML → PDF）
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && python -m playwright install chromium

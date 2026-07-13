@@ -59,6 +59,18 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # 目錄爬取專用 worker（獨立 queue，長時間爬取不影響單品檢查）
+  catalog-worker:
+    build: .
+    command: celery -A app.celery_app.celery_app worker -Q catalog --loglevel=info --concurrency=1
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
   beat:
     build: .
     command: celery -A app.celery_app.celery_app beat --loglevel=info
