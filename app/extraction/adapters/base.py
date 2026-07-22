@@ -20,6 +20,7 @@ if TYPE_CHECKING:  # 避免 runtime 循環 import
 class Availability(str, enum.Enum):
     IN_STOCK = "in_stock"
     OUT_OF_STOCK = "out_of_stock"
+    DELISTED = "delisted"  # 商品頁不存在（404/410），已下架/停售
     UNKNOWN = "unknown"
 
 

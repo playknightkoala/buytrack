@@ -148,8 +148,19 @@ def check_product(product_id: int) -> None:
                     )
             return
 
-        # 成功取得結果（含缺貨）→ 歸零連續失敗計數
+        # 成功取得結果（含缺貨/下架）→ 歸零連續失敗計數
         product.consecutive_failures = 0
+
+        # 3c-0) 下架/停售（商品頁 404/410）：通知一次並停止追蹤
+        if result.availability == Availability.DELISTED:
+            if old_status != ProductStatus.DELISTED:
+                _add_history(session, product_id, None, result.availability)
+                product.status = ProductStatus.DELISTED
+                send_message(
+                    chat_id,
+                    f"🚫 「{_h(product.title or url)}」已下架或停售，已停止追蹤。\n{_h(url)}",
+                )
+            return
 
         # 3c) 缺貨（只在「轉為缺貨」的當下記錄一筆，避免每次檢查重複記）
         if result.availability == Availability.OUT_OF_STOCK:
