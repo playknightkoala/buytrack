@@ -22,11 +22,15 @@ from app.models import ProductStatus, RequestStatus, TrackedProduct, Unsupported
 def cmd_test(url: str) -> None:
     from app.extraction.pipeline import extract_price
 
+    from app.extraction.adapters.base import Availability
+
     result = asyncio.run(extract_price(url))
     print("萃取結果：")
     for k, v in dataclasses.asdict(result).items():
         print(f"  {k}: {v}")
-    if not result.has_price:
+    if result.availability == Availability.DELISTED:
+        print("\n→ 商品已下架/停售（網站本身支援正常）。")
+    elif not result.has_price:
         print("\n→ 未取得價格：此網站需要新增專屬 adapter（見 /add-scraper）。")
 
 

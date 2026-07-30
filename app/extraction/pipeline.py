@@ -27,7 +27,8 @@ async def extract_price(url: str) -> ExtractionResult:
         if adapter is not None:
             try:
                 result = await adapter.extract(url, ctx)
-                if result.has_price:
+                # 下架是「明確結論」，不要 fallback（否則會被誤判成萃取失敗）
+                if result.has_price or result.availability == Availability.DELISTED:
                     return result
                 logger.info("adapter 未取得價格，往下層 fallback: %s", url)
             except Exception:
