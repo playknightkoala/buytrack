@@ -2,6 +2,9 @@
 
 頁面無 JSON-LD / OpenGraph，價格在 `.price_box` 內：
 `.strike`＝原價、`.special`＝特價（如有）。現售價優先取特價，否則取原價。
+
+下架商品：頁面回 200 但會被導向 `/error`（非 404），需另行判定為 DELISTED，
+否則會被誤判成爬蟲失效。
 """
 from __future__ import annotations
 
@@ -18,6 +21,13 @@ class PetalOnlineAdapter(BaseAdapter):
 
     async def extract(self, url: str, ctx: FetchContext) -> ExtractionResult:
         async with ctx.page(url, wait_selector=".price_box") as page:
+            # 下架商品會被導向 /error（頁面仍回 200）
+            if "/error" in page.url:
+                return ExtractionResult(
+                    supported=True,
+                    availability=Availability.DELISTED,
+                    method="adapter:petal-online:delisted",
+                )
             # 特價優先；沒有特價時用整個價格區塊（會抓到原價）
             el = await page.query_selector(".special")
             if el is None:
