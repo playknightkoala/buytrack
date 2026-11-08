@@ -15,6 +15,7 @@ from app.db import session_scope
 from app.extraction.adapters.base import Availability
 from app.extraction.pipeline import extract_price
 from app.sites import site_label
+from zoneinfo import ZoneInfo
 from app.models import (
     PriceHistory,
     ProductStatus,
@@ -76,6 +77,62 @@ def _h(text: str | None) -> str:
     return html.escape(text or "")
 
 
+_TZ = ZoneInfo("Asia/Taipei")
+
+
+def _now_tw() -> str:
+    return dt.datetime.now(_TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def _product_info(product: TrackedProduct, url: str, domain: str, *, with_id: bool) -> str:
+    """通知用的商品資訊區塊（已 HTML 跳脫）。只有商品擁有者才看得到編號。"""
+    lines: list[str] = []
+    if with_id:
+        lines.append(f"編號：#{product.id}")
+    lines += [
+        f"購物網：{_h(site_label(domain))}",
+        f"商品：<b>{_h(product.title or url)}</b>",
+        f"網址：{_h(url)}",
+    ]
+    return "\n".join(lines)
+
+
+def _notify_scrape_broken(
+    product: TrackedProduct, url: str, domain: str, chat_id: int,
+    *, headline: str, owner_note: str, tell_admins: bool,
+) -> None:
+    """抓取失效通知。
+
+    - 擁有者：完整資訊（編號 / 購物網 / 商品 / 網址 / 最後價格 / 失效時間）。
+    - 管理員：若商品是管理員自己的，上一則已含完整資訊，只補一行待辦提示、不重複發；
+      否則只給 商品 / 購物網 / 網址 / 狀況 / 失效時間（不含編號）。
+    """
+    when = _now_tw()
+    admin_ids = settings.admin_id_set
+    owner_text = (
+        f"⚠️ {headline}\n"
+        f"{_product_info(product, url, domain, with_id=True)}\n"
+        f"最後價格：{_money(product.current_price, product.currency)}\n"
+        f"失效時間：{when}\n"
+        f"{owner_note}"
+    )
+    if tell_admins and chat_id in admin_ids:
+        owner_text += "\n🛠 管理員待辦已建立（python -m app.admin pending）。"
+    send_message(chat_id, owner_text)
+    if not tell_admins:
+        return
+    for admin_id in admin_ids:
+        if admin_id == chat_id:
+            continue
+        send_message(
+            admin_id,
+            "🛠 既有商品抓取失效（疑似網站改版 / adapter 失效）\n"
+            f"{_product_info(product, url, domain, with_id=False)}\n"
+            "狀況：已暫停該使用者的追蹤，待管理員修復\n"
+            f"失效時間：{when}",
+        )
+
+
 @celery_app.task(name="app.tasks.check_product")
 def check_product(product_id: int) -> None:
     # 1) 讀取必要欄位（不在抓取期間持有交易）
@@ -110,10 +167,11 @@ def check_product(product_id: int) -> None:
             product.consecutive_failures += 1
             if product.consecutive_failures >= settings.max_consecutive_failures:
                 product.status = ProductStatus.ERROR
-                send_message(
-                    chat_id,
-                    f"⚠️ 「{_h(product.title or url)}」連續抓取失敗（網路或網站異常），"
-                    "已暫停追蹤。可用 /interval 重新啟用。",
+                _notify_scrape_broken(
+                    product, url, domain, chat_id,
+                    headline="連續抓取失敗（網路或網站異常）",
+                    owner_note="已暫停追蹤。可用 /interval 重新啟用。",
+                    tell_admins=False,
                 )
             return
 
@@ -137,14 +195,11 @@ def check_product(product_id: int) -> None:
                 if product.consecutive_failures >= settings.max_consecutive_failures:
                     product.status = ProductStatus.UNSUPPORTED
                     _record_unsupported(session, domain, url, chat_id)
-                    send_message(
-                        chat_id,
-                        f"⚠️ 「{_h(product.title or url)}」的價格抓取已失效"
-                        "（網站可能改版或被擋），已暫停追蹤，並已通知管理員修復。",
-                    )
-                    notify_admins(
-                        f"⚠️ 既有商品抓取失效（疑似網站改版 / adapter 失效）："
-                        f"<b>{_h(domain)}</b>\n{_h(url)}"
+                    _notify_scrape_broken(
+                        product, url, domain, chat_id,
+                        headline="價格抓取已失效（網站可能改版或被擋）",
+                        owner_note="已暫停追蹤，並已通知管理員修復。",
+                        tell_admins=True,
                     )
             return
 
