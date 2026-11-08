@@ -16,6 +16,7 @@ from app.extraction.adapters.base import Availability, ExtractionResult
 from app.extraction.adapters.registry import get_adapter
 from app.extraction.context import build_context
 from app.extraction.structured import parse_structured
+from app.extraction.browser import uses_full_chromium
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +37,11 @@ async def extract_price(url: str) -> ExtractionResult:
 
         # L0：靜態 HTML + 結構化資料
         try:
-            html = await ctx.fetch_static_html(url)
-            result = parse_structured(html, url, method_prefix="static")
-            if result.has_price:
-                return result
+            if not uses_full_chromium(url):
+                html = await ctx.fetch_static_html(url)
+                result = parse_structured(html, url, method_prefix="static")
+                if result.has_price:
+                    return result
         except httpx.HTTPStatusError as exc:
             code = exc.response.status_code
             if code in (404, 410):
